@@ -178,6 +178,51 @@ export interface PingData {
   ts: string
 }
 
+/* ---- 工具调用 ---- */
+
+export type ToolRisk = 'safe' | 'moderate' | 'dangerous'
+
+/** tool.call：模型请求调用工具 */
+export interface ToolCallData {
+  seq: number
+  session_id: string
+  message_id: string
+  call_id: string
+  name: string
+  /** 参数的 JSON 字符串（原样保留，可能不是合法 JSON） */
+  args: string
+  risk: ToolRisk
+  requires_approval: boolean
+}
+
+/** tool.result：工具执行完成 */
+export interface ToolResultData {
+  seq: number
+  session_id: string
+  message_id: string
+  call_id: string
+  name: string
+  output: string
+  is_error: boolean
+  rejected: boolean
+  duration_ms: number
+}
+
+/** 前端聚合后的工具调用视图模型 */
+export interface ToolCallView {
+  call_id: string
+  /** 归属的 assistant 消息 id，用于把卡片挂到正确的那条消息下 */
+  message_id: string
+  name: string
+  args: string
+  risk: ToolRisk
+  requires_approval: boolean
+  /** 尚未收到 result 时为 running */
+  status: 'running' | 'success' | 'error' | 'rejected'
+  output?: string
+  duration_ms?: number
+}
+
 export interface ResyncData {
   session_id: string
   last_event_id: number

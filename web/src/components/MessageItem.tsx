@@ -1,14 +1,21 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import type { Message } from '../api/types'
 import { Markdown } from './Markdown'
 import { useChat } from '../state/chatStore'
+import { ToolCallList } from './ToolCallCard'
 
-/** 单条消息：用户气泡 / 助手气泡（Markdown + 复制 + 状态标记）。 */
+/** 单条消息：用户气泡 / 助手气泡（Markdown + 工具调用 + 复制 + 状态标记）。 */
 export function MessageItem({ message }: { message: Message }) {
-  const { streamingMessageId } = useChat()
+  const { streamingMessageId, toolCalls } = useChat()
   const isUser = message.role === 'user'
   const streaming = streamingMessageId === message.id
   const [copied, setCopied] = useState(false)
+
+  // 只取归属当前这条消息的工具调用，保持到达顺序。
+  const calls = useMemo(
+    () => Object.values(toolCalls).filter((c) => c.message_id === message.id),
+    [toolCalls, message.id],
+  )
 
   const copy = async () => {
     try {
@@ -48,6 +55,9 @@ export function MessageItem({ message }: { message: Message }) {
       </div>
 
       <div className="msg-body">
+        {/* 工具调用在文字之前：模型先调工具、拿到结果后才开始组织回答 */}
+        {calls.length > 0 && <ToolCallList calls={calls} />}
+
         {empty && streaming ? (
           <div className="typing">
             <span />
@@ -56,7 +66,7 @@ export function MessageItem({ message }: { message: Message }) {
           </div>
         ) : empty && message.status === 'error' ? (
           <div className="msg-error">{message.error?.message ?? '生成失败'}</div>
-        ) : (
+        ) : empty && calls.length > 0 ? null : (
           <>
             <Markdown text={message.content} streaming={streaming} />
             {streaming && <span className="caret" />}

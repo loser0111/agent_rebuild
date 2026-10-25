@@ -99,6 +99,53 @@ type chatChunk struct {
 	} `json:"error"`
 }
 
+// pendingCall 累积中的工具调用（流式分片合并用）。
+//
+// 提升到包级别是因为 appendArgs 需要它；原本定义在 Run 内部。
+type pendingCall struct {
+	id      string
+	name    string
+	argsBuf strings.Builder
+}
+
+// appendArgs 把一个 arguments 片段并入累积缓冲。
+//
+// 为什么不能简单 WriteString：
+// OpenAI 官方流式协议里 arguments 是**增量片段**，逐帧拼接即可；
+// 但实测部分网关（含公司内部网关）每帧都发送**完整的** JSON，
+// 直接拼接会得到 `{}{"path":...}`，下游 json.Unmarshal 报
+// "invalid character '{' after top-level value"。
+//
+// 判定策略（保持增量语义优先，避免破坏标准实现）：
+//  1. 缓冲区为空 → 直接写入
+//  2. 累积结果已是完整 JSON → 新片段若是完整 JSON 则替换（重复发送），
+//     否则视为续写（例如后续补齐尾部空格/字段）
+//  3. 累积结果不完整 → 追加
+func appendArgs(buf *strings.Builder, frag string) {
+	cur := buf.String()
+
+	if cur == "" {
+		buf.WriteString(frag)
+		return
+	}
+
+	if json.Valid([]byte(cur)) && json.Valid([]byte(frag)) {
+		// 已完整，且新片段自身也完整 → 重复发送完整参数，以后者为准。
+		buf.Reset()
+		buf.WriteString(frag)
+		return
+	}
+
+	// 兜底：若拼接结果非法但新片段合法，说明是重复发送。
+	joined := cur + frag
+	if !json.Valid([]byte(joined)) && json.Valid([]byte(frag)) {
+		buf.Reset()
+		buf.WriteString(frag)
+		return
+	}
+	buf.WriteString(frag)
+}
+
 func (l *LLMRunner) Run(ctx context.Context, req Request) <-chan Event {
 	out := make(chan Event, 8)
 	go func() {
@@ -161,11 +208,6 @@ func (l *LLMRunner) stream(ctx context.Context, rreq Request, out chan<- Event) 
 
 	// 流式 tool_calls 的累积：OpenAI 按 index 分片返回，
 	// 首片带 id/name，后续片只带 arguments 片段，需要按 index 拼接。
-	type pendingCall struct {
-		id      string
-		name    string
-		argsBuf strings.Builder
-	}
 	pending := make(map[int]*pendingCall)
 	var pendingOrder []int
 
@@ -234,7 +276,7 @@ func (l *LLMRunner) stream(ctx context.Context, rreq Request, out chan<- Event) 
 					pc.name = tc.Function.Name
 				}
 				if tc.Function.Arguments != "" {
-					pc.argsBuf.WriteString(tc.Function.Arguments)
+					appendArgs(&pc.argsBuf, tc.Function.Arguments)
 				}
 			}
 		}

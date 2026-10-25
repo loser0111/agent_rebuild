@@ -214,6 +214,14 @@ func (a *AnthropicRunner) stream(ctx context.Context, rreq Request, out chan<- E
 		id   string
 		name string
 		args strings.Builder
+		// gotDelta 记录是否收到过 input_json_delta。
+		//
+		// 为什么需要它：Anthropic 官方流式协议里 content_block_start 的
+		// input 固定是空对象 {}（占位），真实参数全部通过 input_json_delta
+		// 传输。若把占位的 {} 也写入缓冲，再拼上 delta 就得到
+		// `{"path":...}` 或 `{"}{...}`，下游 json.Unmarshal 报
+		// "invalid character '{' after top-level value"。
+		gotDelta bool
 	}
 	toolBlocks := make(map[int]*pendingTool)
 	var toolOrder []int
@@ -263,8 +271,12 @@ func (a *AnthropicRunner) stream(ctx context.Context, rreq Request, out chan<- E
 					name: ev.ContentBlock.Name,
 				}
 				toolOrder = append(toolOrder, idx)
-				if len(ev.ContentBlock.Input) > 0 && string(ev.ContentBlock.Input) != "null" {
-					toolBlocks[idx].args.Write(ev.ContentBlock.Input)
+				// 这里的 input 有两种可能：
+				//   a) 占位符 {}（官方流式格式），真实参数在后面的 delta 里
+				//   b) 完整参数（非流式风格的网关），后面没有 delta
+				// 先写进缓冲；一旦收到 delta，说明它是占位符，会被整体丢弃。
+				if in := ev.ContentBlock.Input; len(in) > 0 && string(in) != "null" {
+					toolBlocks[idx].args.Write(in)
 				}
 			}
 
@@ -279,7 +291,15 @@ func (a *AnthropicRunner) stream(ctx context.Context, rreq Request, out chan<- E
 					idx = *ev.Index
 				}
 				if pt, exists := toolBlocks[idx]; exists {
-					pt.args.WriteString(ev.Delta.PartialJSON)
+					// 首个 delta 说明 content_block_start 里的 input 只是占位符
+					// （官方固定发 {}），必须丢弃，否则会拼出 `{"path":...}`。
+					if !pt.gotDelta {
+						pt.args.Reset()
+						pt.gotDelta = true
+					}
+					// 后续 delta 正常情况下是增量片段；但部分网关每帧发送
+					// 完整 JSON，交由 appendArgs 判重，避免 `{...}{...}`。
+					appendArgs(&pt.args, ev.Delta.PartialJSON)
 				}
 				continue
 			}

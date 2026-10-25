@@ -21,6 +21,9 @@ import type {
   ResyncData,
   Session,
   SseEvent,
+  ToolCallData,
+  ToolCallView,
+  ToolResultData,
 } from '../api/types'
 
 /** 连接与生成阶段，驱动底部状态栏与输入框禁用逻辑。 */
@@ -33,6 +36,8 @@ export interface ChatState {
   sessionsLoading: boolean
   currentId: string | null
   messages: Message[]
+  /** 当前会话的工具调用记录，按 call_id 索引 */
+  toolCalls: Record<string, ToolCallView>
   detailLoading: boolean
   phase: StreamPhase
   /** 正在生成的 assistant 消息 id（服务端权威 id） */
@@ -50,6 +55,7 @@ const initialState: ChatState = {
   sessionsLoading: true,
   currentId: null,
   messages: [],
+  toolCalls: {},
   detailLoading: false,
   phase: 'idle',
   streamingMessageId: null,
@@ -80,6 +86,9 @@ type Action =
   | { type: 'stream/phase'; payload: StreamPhase }
   | { type: 'stream/event'; payload: number }
   | { type: 'stream/end' }
+  | { type: 'tools/call'; payload: ToolCallView }
+  | { type: 'tools/result'; payload: { call_id: string; patch: Partial<ToolCallView> } }
+  | { type: 'tools/reset' }
   | { type: 'error/set'; payload: string | null }
   | { type: 'reconnect/hint'; payload: string | null }
 
@@ -123,6 +132,7 @@ function reducer(state: ChatState, action: Action): ChatState {
         ...state,
         currentId: action.payload,
         messages: [],
+        toolCalls: {},
         error: null,
         reconnectHint: null,
         lastEventId: 0,
@@ -196,6 +206,36 @@ function reducer(state: ChatState, action: Action): ChatState {
 
     case 'stream/end':
       return { ...state, phase: 'idle', streamingMessageId: null, startedAt: null }
+
+    case 'tools/call':
+      return {
+        ...state,
+        toolCalls: { ...state.toolCalls, [action.payload.call_id]: action.payload },
+      }
+
+    case 'tools/result': {
+      const prev = state.toolCalls[action.payload.call_id]
+      // 结果先于调用事件到达时（重连补齐等）也保留结果，避免丢信息。
+      const base: ToolCallView = prev ?? {
+        call_id: action.payload.call_id,
+        message_id: '',
+        name: '',
+        args: '',
+        risk: 'safe',
+        requires_approval: false,
+        status: 'running',
+      }
+      return {
+        ...state,
+        toolCalls: {
+          ...state.toolCalls,
+          [action.payload.call_id]: { ...base, ...action.payload.patch },
+        },
+      }
+    }
+
+    case 'tools/reset':
+      return { ...state, toolCalls: {} }
 
     case 'error/set':
       return {
@@ -395,6 +435,38 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         })
         break
       }
+      case 'tool.call': {
+        const d = ev.data as ToolCallData
+        dispatch({
+          type: 'tools/call',
+          payload: {
+            call_id: d.call_id,
+            message_id: d.message_id,
+            name: d.name,
+            args: d.args,
+            risk: d.risk,
+            requires_approval: d.requires_approval,
+            status: 'running',
+          },
+        })
+        break
+      }
+      case 'tool.result': {
+        const d = ev.data as ToolResultData
+        dispatch({
+          type: 'tools/result',
+          payload: {
+            call_id: d.call_id,
+            patch: {
+              name: d.name,
+              output: d.output,
+              duration_ms: d.duration_ms,
+              status: d.rejected ? 'rejected' : d.is_error ? 'error' : 'success',
+            },
+          },
+        })
+        break
+      }
       case 'resync': {
         const d = ev.data as ResyncData
         dispatch({ type: 'messages/replaceAll', payload: d.messages ?? [] })
@@ -430,6 +502,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const tempAssistantId = assistantMsg.id
 
       settledRef.current = false
+      // 新的一轮对话：清掉上一轮的工具调用记录，避免串台。
+      dispatch({ type: 'tools/reset' })
       dispatch({ type: 'messages/append', payload: [userMsg, assistantMsg] })
       dispatch({ type: 'stream/begin', payload: { messageId: tempAssistantId } })
 

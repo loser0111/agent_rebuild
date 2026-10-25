@@ -681,6 +681,237 @@ kbd {
   min-width: 0;
 }
 
+/* ============================================================
+   工具调用卡片
+   ============================================================ */
+
+.tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.tool-card {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-panel);
+  overflow: hidden;
+}
+
+/* 运行中的卡片用左侧强调条提示"正在发生" */
+.tool-card.is-running {
+  border-color: var(--border-strong);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.tool-card.is-error {
+  border-color: rgba(229, 72, 77, 0.35);
+}
+
+.tool-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 11px;
+  text-align: left;
+  color: var(--text-soft);
+  transition: background 0.12s ease;
+}
+
+.tool-card-head:hover {
+  background: var(--bg-hover);
+}
+
+/* 状态圆点 */
+.tool-status-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.tool-status-dot.is-running {
+  background: var(--accent);
+  animation: tool-pulse 1.2s ease-in-out infinite;
+}
+
+.tool-status-dot.is-success {
+  background: var(--accent);
+}
+
+.tool-status-dot.is-error {
+  background: var(--danger);
+}
+
+.tool-status-dot.is-rejected {
+  background: var(--warn);
+}
+
+@keyframes tool-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    box-shadow: 0 0 0 0 var(--accent-soft);
+  }
+  50% {
+    opacity: 0.55;
+    box-shadow: 0 0 0 4px var(--accent-soft);
+  }
+}
+
+.tool-name {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.tool-status-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.tool-status-text.is-success {
+  color: var(--accent);
+}
+
+.tool-status-text.is-error {
+  color: var(--danger);
+}
+
+.tool-status-text.is-rejected {
+  color: var(--warn);
+}
+
+/* 运行中的小转圈 */
+.tool-spinner {
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: tool-spin 0.7s linear infinite;
+}
+
+@keyframes tool-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.tool-badge {
+  flex: none;
+  padding: 1px 5px;
+  font-size: 10px;
+  border-radius: 4px;
+  color: var(--text-muted);
+  background: var(--bg-active);
+}
+
+.tool-badge.is-warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.tool-badge.is-danger {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.tool-duration {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.tool-caret {
+  margin-left: auto;
+  font-size: 9px;
+  color: var(--text-faint);
+  transition: transform 0.15s ease;
+}
+
+.tool-caret.is-open {
+  transform: rotate(180deg);
+}
+
+/* 卡片主体 */
+.tool-card-body {
+  padding: 0 11px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.tool-section {
+  margin-top: 9px;
+}
+
+.tool-section-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 5px;
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.tool-flag {
+  padding: 0 4px;
+  font-size: 9.5px;
+  text-transform: none;
+  border-radius: 3px;
+}
+
+.tool-flag.is-error {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.tool-flag.is-warn {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.tool-pre {
+  margin: 0;
+  padding: 8px 10px;
+  max-height: 280px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--text-soft);
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+/* 结果区稍暗一档，和参数区分开 */
+.tool-pre.is-output {
+  color: var(--text-muted);
+  background: var(--bg);
+}
+
+.tool-pending {
+  padding: 6px 2px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.tool-truncated {
+  margin-top: 5px;
+  font-size: 10.5px;
+  color: var(--warn);
+}
+
 .msg-actions {
   display: flex;
   align-items: center;
