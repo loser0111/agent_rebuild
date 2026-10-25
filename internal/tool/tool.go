@@ -87,11 +87,29 @@ type Registry struct {
 	mu    sync.RWMutex
 	tools map[string]Tool
 	order []string // 保持注册顺序，让工具列表稳定
+	root  string   // 工作区根目录（仅供观测与诊断，工具自身已捕获该值）
 }
 
 // NewRegistry 创建空注册表。
 func NewRegistry() *Registry {
 	return &Registry{tools: make(map[string]Tool)}
+}
+
+// SetWorkspaceRoot 记录工作区根目录。
+func (r *Registry) SetWorkspaceRoot(root string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.root = root
+}
+
+// WorkspaceRoot 返回工具实际使用的工作区根目录。
+//
+// 单独暴露是为了排查「文件操作被限制在意外目录」这类问题：
+// 日志里能直接看到根目录，而不用逐个工具去反推。
+func (r *Registry) WorkspaceRoot() string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.root
 }
 
 // Register 注册工具。名字重复会 panic（属于编程错误，应在启动时暴露）。

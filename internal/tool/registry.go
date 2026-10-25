@@ -18,6 +18,42 @@ type Options struct {
 	ReadOnly bool
 }
 
+// resolveWorkspace 决定工具的工作根目录。
+//
+// 为什么要特殊处理空值：filepath.Abs("") 返回的是**进程当前工作目录**，
+// 而不是用户期望的「项目根」或「主目录」。桌面端通过
+// `cd desktop && electron .` 启动时，sidecar 的 cwd 就是 desktop/，
+// 于是所有文件操作被静默锁在那个子目录里，用户只会看到
+// 「无权访问」却不知道原因。
+//
+// 因此空值时回退到用户主目录并显式告警，让行为可预期。
+func resolveWorkspace(raw string) string {
+	cleaned := strings.TrimSpace(raw)
+	if cleaned == "" {
+		home, err := os.UserHomeDir()
+		if err == nil && home != "" {
+			slog.Warn("TOOL_WORKSPACE 未设置，工具将限制在用户主目录",
+				"workspace", home,
+				"hint", "设置 TOOL_WORKSPACE 可指定具体的项目目录")
+			return home
+		}
+		// 连主目录都拿不到（极端环境）：只能退回 cwd。
+		if wd, wdErr := os.Getwd(); wdErr == nil {
+			slog.Warn("TOOL_WORKSPACE 未设置且无法确定主目录，使用当前工作目录",
+				"workspace", wd)
+			return wd
+		}
+		return "."
+	}
+
+	abs, err := filepath.Abs(cleaned)
+	if err != nil {
+		slog.Warn("TOOL_WORKSPACE 解析失败，按原值使用", "raw", cleaned, "err", err)
+		return cleaned
+	}
+	return abs
+}
+
 // DefaultRegistry 按配置装配默认工具集。
 //
 // 参考 Codex / Claude Code 的取舍：
@@ -25,17 +61,14 @@ type Options struct {
 //   - 写操作（write_file / edit_file）默认启用，但标为中风险
 //   - 命令执行默认**不启用**，需显式开启（最危险）
 func DefaultRegistry(opts Options) *Registry {
-	root, err := filepath.Abs(opts.Workspace)
-	if err != nil {
-		slog.Warn("工作目录解析失败，使用当前目录", "err", err)
-		root = opts.Workspace
-	}
+	root := resolveWorkspace(opts.Workspace)
 	// 确保目录存在，避免工具链在首次调用时集体失败。
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		slog.Warn("创建工具工作目录失败", "dir", root, "err", err)
 	}
 
 	reg := NewRegistry()
+	reg.SetWorkspaceRoot(root)
 
 	// 只读工具：始终注册。
 	reg.Register(

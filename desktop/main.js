@@ -108,6 +108,37 @@ function resolveUIDir() {
 }
 
 /**
+ * 解析工具工作区根目录。
+ *
+ * 为什么必须显式指定：
+ *   后端 DEFAULT_REGISTRY 在 TOOL_WORKSPACE 为空时会执行 filepath.Abs("")，
+ *   拿到的是「进程当前工作目录」。dev 模式下通过 `cd desktop && electron .`
+ *   启动，sidecar 继承的 cwd 就是 desktop/，于是所有文件读写都被锁在
+ *   agent_rebuild/desktop 里——用户想改项目其它文件时会莫名其妙被拒。
+ *
+ * 取值优先级：
+ *   1. 用户在 config.env 里显式配的 TOOL_WORKSPACE（尊重用户意图）
+ *   2. dev 模式：仓库根目录（__dirname 的上一级）
+ *   3. 打包模式：用户主目录（app 包内是只读的，不能作为工作区）
+ */
+function resolveToolWorkspace(devRoot, sidecarEnv) {
+  const explicit = (sidecarEnv.TOOL_WORKSPACE || '').trim()
+  if (explicit) return path.resolve(explicit)
+
+  const isDev = !app.isPackaged
+  const candidate = isDev ? devRoot : app.getPath('home')
+
+  try {
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      return path.resolve(candidate)
+    }
+  } catch {
+    /* 目录不可访问时退回主目录 */
+  }
+  return app.getPath('home')
+}
+
+/**
  * 启动 sidecar 并等待就绪。
  * @returns {Promise<string>} 服务地址，如 http://localhost:49565
  */
@@ -133,10 +164,11 @@ function startSidecar() {
   log('前端产物:', uiDir || '(未找到)')
 
   // 解析配置：主进程负责找 .env（打包后 cwd 是 /，sidecar 自己找不到）。
+  const devRoot = path.resolve(__dirname, '..')
   const { env: sidecarEnv, configFile, effective } = resolveSidecarEnv({
     userDataDir: app.getPath('userData'),
     appDir: path.dirname(bin),
-    devRoot: path.resolve(__dirname, '..'),
+    devRoot,
     processEnv: process.env,
     log,
   })
@@ -177,9 +209,15 @@ function startSidecar() {
       // 但桌面场景下「关掉应用就丢数据」几乎总是意外而非本意。
       // 因此只尊重显式 sqlite，其余一律用 sqlite；要 memory 需设 AGENT_ALLOW_MEMORY=1。
       STORE_DRIVER: resolveDesktopStoreDriver(sidecarEnv),
+      // 工具工作区：不指定会退化成「sidecar 的 cwd」，
+      // 导致文件操作被锁在 desktop/ 目录内。
+      TOOL_WORKSPACE: resolveToolWorkspace(devRoot, sidecarEnv),
     },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
+    // 显式指定 cwd：不设置会继承 Electron 主进程的工作目录，
+    // 在某些启动方式下是 app 包内（只读）或 desktop/，容易踩坑。
+    cwd: devRoot,
     // detached=false：子进程与父进程同进程组，父进程被强杀时
     // 系统会一起回收，避免留下孤儿 sidecar 占端口。
     detached: false,
