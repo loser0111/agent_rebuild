@@ -1,0 +1,53 @@
+# ---- Go ----
+/bin/
+/tmp/
+*.test
+*.out
+coverage.*
+.DS_Store
+
+# ---- 环境变量（只提交 .env.example）----
+.env
+.env.*
+!.env.example
+
+# ---- 前端 ----
+node_modules/
+web/dist/
+web/.vite/
+*.local
+.vite-cache/
+*.tsbuildinfo
+
+# ---- 桌面端（Electron）----
+desktop/release/
+desktop/sidecar/
+desktop/ui/
+desktop/node_modules/
+
+# ---- 日志 ----
+*.log
+logs/
+
+# ---- 本地数据库（SQLite）----
+# 数据库里存有加密后的 API Key，绝不能进版本库。
+# 正常情况下数据目录在用户目录下（见 internal/config/datadir.go），
+# 这里兜底覆盖「DATA_DIR 被设为项目内路径」或「UserConfigDir 失败
+# 退化为当前目录」的情况。
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+# 例外：确实需要入库的测试夹具请显式放行，例如
+# !internal/testdata/fixture.db
+
+# ---- 编辑器 ----
+.idea/
+.vscode/
+*.swp
+
+# ---- 系统 ----
+Thumbs.db

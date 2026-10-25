@@ -1,0 +1,51 @@
+{
+  "name": "agent-rebuild-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agent Rebuild 桌面客户端（Electron + Go sidecar）",
+  "main": "main.js",
+  "author": "agent_rebuild",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dev": "AGENT_DEV=1 electron .",
+    "prepare-sidecar": "node scripts/prepare-sidecar.mjs",
+    "make-icon": "node scripts/make-icon.mjs",
+    "smoke": "node scripts/smoke-electron.mjs",
+    "pack": "npm run prepare-sidecar && npm run make-icon && electron-builder --dir",
+    "dist": "npm run prepare-sidecar && npm run make-icon && electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "dev.agentrebuilt.desktop",
+    "productName": "Agent Rebuild",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": ["main.js", "preload.js", "config-loader.js", "sidecar/**", "ui/**"],
+    "asarUnpack": ["sidecar/**", "ui/**"],
+    "extraResources": [],
+    "asar": true,
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [{ "target": "dir", "arch": ["arm64"] }],
+      "icon": "build/icon.png",
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false,
+      "identity": null
+    },
+    "win": {
+      "target": [{ "target": "dir", "arch": ["x64"] }],
+      "icon": "build/icon.png"
+    },
+    "linux": {
+      "target": ["dir"],
+      "category": "Development",
+      "icon": "build/icon.png"
+    }
+  }
+}

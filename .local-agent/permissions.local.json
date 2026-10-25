@@ -1,0 +1,6 @@
+{
+  "allow": [
+    "exec_shell(cd /Users/temptrip/external/agent_rebuild)",
+    "exec_shell(cd /Users/temptrip/external/agent_rebuild/web)"
+  ]
+}
