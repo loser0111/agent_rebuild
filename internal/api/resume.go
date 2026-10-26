@@ -224,6 +224,11 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 		s.respondStoreError(w, r, err)
 		return
 	}
+	// resume 这一步已经把答案补成了 tool 结果，这里只需要再纠正一下
+	// 可能滞留 streaming 的历史消息状态（不处理悬空 tool_calls，
+	// 原因见 session.RepairHistory 的函数注释——resume 本身走的
+	// 正是 ask_user 挂起这个合法场景，不能被误判成"中断"）。
+	history = session.RepairHistory(history)
 
 	// 模型沿用会话上次的选择。
 	modelConfigID := sess.ModelConfigID

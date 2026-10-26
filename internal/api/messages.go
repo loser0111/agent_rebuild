@@ -134,6 +134,14 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		s.respondStoreError(w, r, err)
 		return
 	}
+	// 修复可能因上一次中断（落库超时 / 进程崩溃）留下的不一致历史：
+	// 滞留 streaming 状态的消息修正为 complete/interrupted。
+	// 纯内存操作，不产生任何额外的数据库写入。
+	// 注意：不处理悬空 tool_calls——那交给 agent/llm.go、
+	// agent/anthropic.go 在构建请求时按 declared/answered 校验剔除，
+	// 否则会误伤 ask_user 挂起期间天然存在的"声明未应答"状态
+	// （见 internal/session/repair.go 顶部注释的详细说明）。
+	history = session.RepairHistory(history)
 
 	// stream=false：聚合为非流式 JSON（同步执行，不进 executor）。
 	if req.Stream != nil && !*req.Stream {
@@ -357,6 +365,9 @@ func (s *Server) sendMessageAggregated(
 
 	s.finishMessage(sessionID, placeholder.ID, acc.String(), session.StatusComplete, nil, usage)
 	msgs, _ := s.store.Messages(ctx, sessionID)
+	// 修一下可能滞留 streaming 的历史消息状态，返回给调用方的内容才自洽
+	// （不处理悬空 tool_calls，原因见 session.RepairHistory 的函数注释）。
+	msgs = session.RepairHistory(msgs)
 	var userMsg, assistantMsg *session.Message
 	for i := range msgs {
 		if msgs[i].ID == placeholder.ID {

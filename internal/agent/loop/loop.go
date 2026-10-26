@@ -27,7 +27,7 @@ import (
 const (
 	// DefaultMaxSteps 单次对话最多几轮「模型→工具」迭代。
 	// 防止模型陷入死循环（反复调用同一工具）。
-	DefaultMaxSteps = 12
+	DefaultMaxSteps = 200
 	// DefaultToolTimeout 单个工具执行超时。
 	DefaultToolTimeout = 120 * time.Second
 )

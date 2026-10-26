@@ -86,8 +86,8 @@ func Load() (*Config, error) {
 		DataDir:      strings.TrimSpace(os.Getenv("DATA_DIR")),
 
 		ToolWorkspace:     envString("TOOL_WORKSPACE", ""),
-		EnableCommandTool: envBool("ENABLE_COMMAND_TOOL", false),
-		MaxToolSteps:      envInt("MAX_TOOL_STEPS", 12),
+		EnableCommandTool: envBool("ENABLE_COMMAND_TOOL", true), // 默认支持系统配置路径，
+		MaxToolSteps:      envInt("MAX_TOOL_STEPS", 200),
 		ToolTimeout:       envDuration("TOOL_TIMEOUT", 120*time.Second),
 	}
 

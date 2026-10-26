@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"time"
 
+	"agent_rebuild/internal/session"
 	"agent_rebuild/internal/sse"
 )
 
@@ -57,6 +58,10 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			s.respondStoreError(w, r, msgErr)
 			return
 		}
+		// 全量快照同样修一下滞留 streaming 的消息状态：否则重连后
+		// 内容明明已完整的那条消息还会显示"生成中"。悬空 tool_calls
+		// 不处理，交给前端 rebuildToolCalls + Checkpoint.Pending。
+		msgs = session.RepairHistory(msgs)
 		if err := sw.WriteEvent(sse.Event{
 			ID:   s.hub.LastID(sessionID),
 			Name: sse.EventResync,

@@ -409,12 +409,19 @@ func (e *Executor) run(runCtx context.Context, task *Task, req Request, cancel c
 
 	// 兜底落库用独立 ctx：执行 ctx 可能已取消，不能用它写库。
 	//
-	// 注意：这里**不能**用 defer cancel。streamEvents 内部有自己的
-	// goroutine 负责工具调用落库，外层函数返回时它可能还没写完；
-	// 若此时取消 persistCtx，就会得到 "context canceled" 而丢失
-	// 全部 tool_calls 与工具结果（历史里只剩普通文本，模型下次会重调工具）。
-	// 因此改为在启动 goroutine 结束后显式取消。
-	persistCtx, persistCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// 注意：这里**不能**用 defer cancel，原因见下方注释。
+	//
+	// 关键：这里**不设整体超时**。早期实现给 persistCtx 设过 30s 固定超时，
+	// 问题是 runCtx（整轮执行）可以跑到几分钟甚至更久，而工具调用可能发生在
+	// 执行的任意时刻——一旦某次工具调用落库发生在 30s 之后，会直接超时失败，
+	// 与"任务跑多久"无关，只与"工具调用发生得多晚"有关，是一个与实际执行时长
+	// 脱节的超时设计（线上出现过大量 context deadline exceeded 正是此因）。
+	//
+	// 现在改为：persistCtx 本身不设超时，每一次实际的数据库操作
+	// （appendToolCallMessage / appendToolResultMessage / persistMessage）
+	// 各自套一个较短的独立超时（见对应函数），既能防止单次数据库操作真正
+	// 卡死，又不会因为"整体跑得久"而误伤本该成功的落库。
+	persistCtx := context.Background()
 
 	finish := func(status Status, content string, msgStatus session.MessageStatus, msgErr *session.MessageError, usage *sse.Usage) {
 		task.mu.Lock()
@@ -425,10 +432,10 @@ func (e *Executor) run(runCtx context.Context, task *Task, req Request, cancel c
 
 	var acc []byte
 	// 优先用 Loop（支持工具循环）；未配置时退化为单轮 Runner。
-	// done 信号用于等待内部 goroutine（含工具落库）真正结束。
+	// done 信号用于等待内部 goroutine（含工具落库）真正结束，
+	// 确保 run() 返回前，所有工具调用/结果都已经尝试落库完毕。
 	events, eventsDone := e.streamEvents(runCtx, runner, req, persistCtx)
 	defer func() {
-		// 等内部 goroutine 收尾再释放 persistCtx。
 		if eventsDone != nil {
 			select {
 			case <-eventsDone:
@@ -436,7 +443,6 @@ func (e *Executor) run(runCtx context.Context, task *Task, req Request, cancel c
 				slog.Warn("等待工具落库超时", "session_id", req.SessionID)
 			}
 		}
-		persistCancel()
 	}()
 
 	for {
@@ -534,11 +540,28 @@ func (e *Executor) run(runCtx context.Context, task *Task, req Request, cancel c
 				// （OpenAI 要求 tool 结果紧跟其 tool_calls）。
 				e.appendToolCallMessage(persistCtx, req.SessionID, call)
 
-				eventName := sse.EventToolCall
-				if call.RequiresApproval {
-					eventName = sse.EventToolApproval
-				}
-				task.Publish(eventName, func(seq uint64) any {
+				// 第一轮不区分「需审批」与「普通调用」在事件层面的推送：
+				// 统一发 tool.call，不发 tool.approval。
+				//
+				// 原因：真正的审批拦截点在 loop.suspendAll，它只看
+				// Spec.Interactive（目前只有 ask_user），完全不看
+				// RequiresApproval——也就是说 run_command 这类
+				// RiskDangerous 工具本来就不会被服务端拦下来等人确认，
+				// 该走的执行一步没少。但事件名一旦分叉成 tool.approval，
+				// 前端 chatStore.tsx 的 handleEvent 里根本没有对应的 case，
+				// 会落进 default 被 console.debug 悄悄吞掉——调用本身
+				// 「正常执行了」但用户在界面上完全看不到过程，
+				// 后续 tool.result 到达时也因为找不到对应的卡片而变成
+				// message_id 为空的孤儿记录，永远挂不到任何消息下面。
+				//
+				// 目前还没有做真正的人工审批 UI（PendingApproval 只是
+				// 协议占位，见 session.Checkpoint 的注释），在这套 UI
+				// 落地之前，区分两种事件名只有"砍掉可见性"这一个实际效果，
+				// 没有任何审批上的收益。所以第一轮统一按普通调用处理：
+				// Risk / RequiresApproval 两个字段仍然原样透传给前端
+				// （ToolCallCard 会据此渲染"需确认"徽章，纯展示，不拦截），
+				// 为将来真正实现审批时保留接线点，但不再影响事件路由。
+				task.Publish(sse.EventToolCall, func(seq uint64) any {
 					return sse.ToolCallData{
 						Seq: seq, SessionID: req.SessionID, MessageID: req.MessageID,
 						CallID: call.ID, Name: call.Name, Args: call.Args,
@@ -711,6 +734,15 @@ func (e *Executor) streamEvents(
 	return out, done
 }
 
+// persistOpTimeout 是单次数据库写操作的超时上限。
+//
+// 这个超时只保护"单次 SQL 执行"本身（给 SQLite 的 busy_timeout 之外再加一层
+// 应用层兜底），不代表"整个任务的持久化阶段"——后者不应该有总时限，详见
+// run() 里 persistCtx 的注释。15s 对本地 SQLite 单条 INSERT/UPDATE 是很宽松
+// 的上限：正常情况下这类写入是毫秒级的，只有真正卡死（锁等待、磁盘异常）才
+// 会触发。
+const persistOpTimeout = 15 * time.Second
+
 // appendToolCallMessage 立即落库一条 assistant(tool_calls) 消息。
 //
 // 每条 tool_call 落一条独立 assistant 消息，与随后的 tool 结果严格配对。
@@ -718,6 +750,10 @@ func (e *Executor) appendToolCallMessage(ctx context.Context, sessionID string, 
 	if e.store == nil {
 		return
 	}
+	// 单操作超时：与 persistCtx 本身是否有整体时限无关，见 persistOpTimeout。
+	opCtx, cancel := context.WithTimeout(ctx, persistOpTimeout)
+	defer cancel()
+
 	now := time.Now().UTC()
 	m := &session.Message{
 		ID:        session.NewMessageID(),
@@ -731,9 +767,14 @@ func (e *Executor) appendToolCallMessage(ctx context.Context, sessionID string, 
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	if err := e.store.AppendMessage(ctx, m); err != nil {
+	if err := e.store.AppendMessage(opCtx, m); err != nil {
 		slog.Warn("工具调用消息落库失败", "err", err,
 			"session_id", sessionID, "call_id", call.ID)
+		// 注意：这里不重试、不 panic。万一这次落库失败，这个 call_id 会
+		// 在历史里"悬空"（无 assistant 声明却可能有 tool 结果，或反之）。
+		// agent/llm.go、agent/anthropic.go 构建请求时本来就会校验
+		// declared/answered 是否成对，不成对的一律剔除——不会导致
+		// 下一次请求被 API 拒绝，只是这次工具调用对模型"看起来没发生过"。
 	}
 }
 
@@ -742,6 +783,9 @@ func (e *Executor) appendToolResultMessage(ctx context.Context, sessionID string
 	if e.store == nil {
 		return
 	}
+	opCtx, cancel := context.WithTimeout(ctx, persistOpTimeout)
+	defer cancel()
+
 	status := session.StatusComplete
 	if r.IsError {
 		status = session.StatusError
@@ -757,9 +801,12 @@ func (e *Executor) appendToolResultMessage(ctx context.Context, sessionID string
 		CreatedAt:  now,
 		UpdatedAt:  now,
 	}
-	if err := e.store.AppendMessage(ctx, m); err != nil {
+	if err := e.store.AppendMessage(opCtx, m); err != nil {
 		slog.Warn("工具结果落库失败", "err", err,
 			"session_id", sessionID, "call_id", r.CallID)
+		// 同上：这个 call_id 的结果没写进去，下次构建请求时
+		// agent/llm.go、agent/anthropic.go 的 declared/answered 校验
+		// 会发现它"声明了但没应答"，直接把这条调用声明一起丢弃。
 	}
 }
 
@@ -775,7 +822,9 @@ func (e *Executor) markSessionAwaitingInput(ctx context.Context, sessionID strin
 	if e.store == nil {
 		return
 	}
-	if _, err := e.store.Update(ctx, sessionID, func(sc *session.Session) error {
+	opCtx, cancel := context.WithTimeout(ctx, persistOpTimeout)
+	defer cancel()
+	if _, err := e.store.Update(opCtx, sessionID, func(sc *session.Session) error {
 		sc.Status = session.SessionSuspended
 		return nil
 	}); err != nil && !errors.Is(err, session.ErrNotFound) {
@@ -791,7 +840,11 @@ func (e *Executor) persistMessage(
 	if e.store == nil {
 		return
 	}
-	err := e.store.UpdateMessage(ctx, sessionID, msgID, func(m *session.Message) error {
+	// 单操作超时（而非整体 persistCtx 超时），理由同 appendToolCallMessage。
+	opCtx, cancel := context.WithTimeout(ctx, persistOpTimeout)
+	defer cancel()
+
+	err := e.store.UpdateMessage(opCtx, sessionID, msgID, func(m *session.Message) error {
 		m.Content = content
 		m.Status = msgStatus
 		m.Error = msgErr
@@ -806,6 +859,10 @@ func (e *Executor) persistMessage(
 	})
 	if err != nil {
 		slog.Error("落库消息最终状态失败", "err", err, "session_id", sessionID, "message_id", msgID)
+		// 这里失败不代表内容丢失：content 已经通过 SSE 推给了前端，
+		// 只是这条消息在数据库里会停留在 streaming 状态。下次读取历史时
+		// session.RepairHistory 会据此 content 非空，判定为 complete，
+		// 不需要用户重新运行这条消息。
 		return
 	}
 
@@ -813,7 +870,9 @@ func (e *Executor) persistMessage(
 	if msgStatus == session.StatusError {
 		sessStatus = session.SessionError
 	}
-	if _, err := e.store.Update(ctx, sessionID, func(sc *session.Session) error {
+	// 会话状态复位同样只给单次操作超时，不借用上面可能已耗尽的 opCtx
+	// （UpdateMessage 失败时已经 return，这里的 opCtx 仍未取消，可以复用）。
+	if _, err := e.store.Update(opCtx, sessionID, func(sc *session.Session) error {
 		sc.Status = sessStatus
 		return nil
 	}); err != nil && !errors.Is(err, session.ErrNotFound) {

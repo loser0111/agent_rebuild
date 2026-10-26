@@ -116,6 +116,11 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 		s.respondStoreError(w, r, err)
 		return
 	}
+	// 展示给用户前同样修一下滞留 streaming 的消息状态，避免刷新后
+	// 某条回复内容明明完整却还显示"生成中"。纯内存操作，不写数据库。
+	// 悬空 tool_calls（含 ask_user 挂起）不在这里处理，交给前端
+	// rebuildToolCalls 结合 Checkpoint.Pending 区分"等待回答"与"真丢失"。
+	msgs = session.RepairHistory(msgs)
 	respondJSON(w, r, http.StatusOK, sessionDetailResponse{
 		Session:     sess,
 		Messages:    msgs,
