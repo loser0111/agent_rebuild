@@ -1,0 +1,16 @@
+internal/config/config.go
+  h_82b3248fceb535 89-90
+internal/agent/loop/loop.go
+  h_82b3248fceb535 30
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.51-trip",
+  "base_commit_sha": "ec60725309a37683359ba2b2c527e4763c0d05fb",
+  "prompts": {},
+  "humans": {
+    "h_82b3248fceb535": {
+      "author": "wangyongqing <wangyongqing@trip.com>"
+    }
+  }
+}
