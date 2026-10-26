@@ -333,6 +333,25 @@ func (e *Executor) SetCheckpointer(cp session.CheckpointStore) {
 	e.checkpointer = cp
 }
 
+// SetApprover 运行时热替换审批策略，不影响已注册的工具/系统提示/步数限制。
+//
+// 单独一个 setter 而不是复用 SetTools：切换审批模式（manual/model/auto）
+// 时没有理由连 registry、systemPrompt、maxSteps、toolTimeout 一起重设——
+// 那些要么没变，要么重设它们本身就有风险（比如把 systemPrompt 的工具
+// 使用准则重复追加一遍）。调用方（Server.SetApprovalMode）只需要换掉
+// Approver 这一个字段。
+//
+// 并发安全：已经在跑的任务会在下一次 streamEvents 读取快照时拿到新值——
+// 当前实现里 streamEvents 对 e.approver 没有做快照读取（见下方 run 时机），
+// 而是 loop.New 时直接读 e.approver 字段，所以严格来说只影响"尚未进入
+// loop.New 构造"的那一刻。对运行中的单次工具调用没有影响：
+// evaluateApprovals 在同一轮 Run() 内只会读一次 Approver。
+func (e *Executor) SetApprover(approver loop.Approver) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.approver = approver
+}
+
 // withToolGuidance 在用户系统提示后追加工具使用准则。
 //
 // 为什么放在代码里而不是只写文档：这是「不照做就明显变差」的行为约束，

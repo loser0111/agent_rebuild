@@ -1,6 +1,7 @@
 /* REST 客户端封装：统一错误处理，不引入 axios。 */
 import type {
   ApiError,
+  ApprovalModeResponse,
   CheckpointResponse,
   CreateSessionResponse,
   HealthResponse,
@@ -132,4 +133,14 @@ export const api = {
 
   testModel: (id: string) =>
     request<TestModelConfigResponse>(`/models/${id}/test`, { method: 'POST' }),
+
+  /* ---- 审批模式（运行时切换，见 docs/12-approval-modes.md） ---- */
+
+  getApprovalMode: () => request<ApprovalModeResponse>('/approval-mode'),
+
+  setApprovalMode: (mode: 'manual' | 'model' | 'auto') =>
+    request<ApprovalModeResponse>('/approval-mode', {
+      method: 'PUT',
+      body: JSON.stringify({ mode }),
+    }),
 }

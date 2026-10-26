@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useChat } from '../state/chatStore'
 import { useModels } from '../state/modelsStore'
+import { useApprovalMode } from '../state/approvalModeStore'
 import { ModelPicker } from './ModelPicker'
+import { ApprovalModePicker } from './ApprovalModePicker'
 import { AskUserCard } from './AskUserCard'
 import { ApprovalCard } from './ApprovalCard'
 
@@ -39,6 +41,13 @@ export function Composer({ onOpenModelManager }: ComposerProps) {
     resume,
   } = useChat()
   const { models } = useModels()
+  const {
+    mode: approvalMode,
+    options: approvalModeOptions,
+    toolsEnabled: approvalToolsEnabled,
+    switching: approvalSwitching,
+    setMode: setApprovalMode,
+  } = useApprovalMode()
   const [value, setValue] = useState('')
   const taRef = useRef<HTMLTextAreaElement>(null)
 
@@ -192,6 +201,14 @@ export function Composer({ onOpenModelManager }: ComposerProps) {
               onChange={(id) => void setActiveModel(id)}
               onOpenManager={onOpenModelManager}
             />
+            {approvalToolsEnabled && (
+              <ApprovalModePicker
+                value={approvalMode}
+                options={approvalModeOptions}
+                switching={approvalSwitching}
+                onChange={(m) => void setApprovalMode(m)}
+              />
+            )}
             <span className="composer-hint">
               {isStreaming
                 ? '生成中…'

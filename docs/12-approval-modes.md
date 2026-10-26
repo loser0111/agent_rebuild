@@ -358,6 +358,21 @@ for _, callID := range callOrder {
 - `ToolCallCard`：收到 `tool.approval` 事件时，渲染"批准 / 拒绝"按钮而不是纯展示（目前 `Risk`/`RequiresApproval` 已经透传，只是没有交互）。
 - 刷新后通过 `GET /checkpoint` 恢复待审批卡片（与 ask_user 完全一致的套路，`kind` 字段区分渲染哪种卡片）。
 - 拒绝时可选填理由框，映射到 `resumeRequest.Reason`。
+- `ApprovalModePicker`（`web/src/components/ApprovalModePicker.tsx`）：仿 `ModelPicker` 自绘下拉，挂载在 `Composer` 的 `composer-left` 区域、`ModelPicker` 右侧。**注意它改的是整个进程的审批策略，不是某个会话的设置**——与 `ModelPicker`（会话级选模型）语义不同，所以单独拆了 `ApprovalModeProvider`（`web/src/state/approvalModeStore.tsx`），不混进 `modelsStore`。`tools_enabled=false`（未启用工具系统）时隐藏整个控件。
+
+---
+
+## 6.1 运行时切换（无需重启进程）
+
+最初的实现里，`APPROVAL_MODE` 只能通过环境变量在进程启动时设置一次（`Server.SetTools` 里读 `cfg.ApprovalMode` 装配一次性的 `Approver`）。后续补了运行时切换能力，流程：
+
+1. `Executor.SetApprover(approver loop.Approver)`（`internal/executor/executor.go`）：单独的 setter，只换 `e.approver` 这一个字段，不touch `registry`/`systemPrompt`/`maxSteps`/`toolTimeout`（这些没理由跟着一起重设，重设 `systemPrompt` 还有把工具准则重复追加的风险）。
+2. `Server.buildApprover(mode)`：从 `SetTools` 里抽出来的共享装配逻辑，`SetTools`（启动时）和 `SetApprovalMode`（运行时）两处复用，避免各写一份 `switch` 产生漂移。
+3. `Server.SetApprovalMode(mode) error`：校验（复用 `config.NormalizeApprovalMode`，拒绝非法值）→ 要求 `s.tools != nil`（没工具就没有审批这件事）→ `buildApprover` → `exec.SetApprover` → 用 `approvalMu`（`sync.RWMutex`）更新 `s.approvalMode`。
+4. `Server.ApprovalMode() config.ApprovalMode`：供 `GET /api/approval-mode` 查询当前值；未启用工具时返回空串。
+5. 路由：`GET /api/approval-mode`（查询）、`PUT /api/approval-mode`（切换，body `{"mode":"manual"}`），`internal/api/approval_mode.go`，响应体 `{mode, options, tools_enabled}`。
+
+**并发/一致性边界**：切换对"切换之后新发起的" `evaluateApprovals` 立即生效；已经处于 `AwaitingHuman` 挂起态的调用不受影响（其审批结果已经写进 checkpoint，走的是 `/resume` 的 `decisions` 分支，不再经过 `Approver`）。`ModelApprover.Judge` 仍然固定用 `s.runner` 构造时的那个 Runner（与模型热切换是两个独立的开关，运行时切换审批模式不会连带切换 judge 用的模型）。
 
 ---
 

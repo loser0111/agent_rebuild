@@ -328,3 +328,18 @@ export interface SseEvent {
   event: string
   data: unknown
 }
+
+/* ---- 审批模式（运行时切换） ---- */
+
+/** 三档审批模式，与后端 config.ApprovalMode 对齐。 */
+export type ApprovalMode = 'manual' | 'model' | 'auto'
+
+/** GET/PUT /api/approval-mode 共用的响应体。 */
+export interface ApprovalModeResponse {
+  /** 当前生效模式；tools_enabled=false 时为空字符串。 */
+  mode: ApprovalMode | ''
+  /** 可选模式列表（固定三档，顺序即展示顺序）。 */
+  options: ApprovalMode[]
+  /** 工具系统未启用时为 false——没有工具就没有审批，前端应隐藏切换控件。 */
+  tools_enabled: boolean
+}

@@ -55,6 +55,12 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/tools", s.handleListTools)
 	mux.HandleFunc("/api/tools", methodNotAllowed("GET"))
 
+	// 审批模式：查询当前生效模式 / 运行时切换（manual|model|auto），
+	// 无需重启进程（见 Server.SetApprovalMode 注释）。
+	mux.HandleFunc("GET /api/approval-mode", s.handleGetApprovalMode)
+	mux.HandleFunc("PUT /api/approval-mode", s.handleSetApprovalMode)
+	mux.HandleFunc("/api/approval-mode", methodNotAllowed("GET, PUT"))
+
 	mux.HandleFunc("PUT /api/models/{id}", s.handleUpdateModelConfig)
 	mux.HandleFunc("DELETE /api/models/{id}", s.handleDeleteModelConfig)
 	mux.HandleFunc("/api/models/{id}", methodNotAllowed("PUT, DELETE"))

@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"agent_rebuild/internal/agent"
@@ -41,6 +43,13 @@ type Server struct {
 	tools *tool.Registry
 	// checkpoints 断点存储（nil 表示不支持挂起等待回答）。
 	checkpoints session.CheckpointStore
+
+	// approvalMu 保护 approvalMode：该字段在 SetTools（启动时）写一次，
+	// 之后可能被 handleSetApprovalMode（运行时，HTTP handler 并发调用）
+	// 反复读写，必须加锁——不同于其余在启动阶段一次性赋值、之后只读的字段。
+	approvalMu sync.RWMutex
+	// approvalMode 当前生效的审批模式，供 GET /api/approval-mode 查询。
+	approvalMode config.ApprovalMode
 }
 
 // NewServer 组装 HTTP 层依赖。
@@ -72,27 +81,74 @@ func (s *Server) SetTools(registry *tool.Registry, systemPrompt string, maxSteps
 	if registry == nil {
 		return
 	}
-	var approver loop.Approver
-	switch s.cfg.ApprovalMode {
+	approver := s.buildApprover(s.cfg.ApprovalMode)
+	s.exec.SetTools(registry, systemPrompt, maxSteps, timeout, approver)
+	s.tools = registry
+	s.approvalMu.Lock()
+	s.approvalMode = s.cfg.ApprovalMode
+	s.approvalMu.Unlock()
+}
+
+// buildApprover 按模式装配对应的 Approver 实现。
+//
+// 从 SetTools 里抽出来，是因为 SetApprovalMode（运行时切换）需要同一份
+// 装配逻辑——两处各写一份 switch 迟早会在改一边忘了改另一边时产生漂移。
+func (s *Server) buildApprover(mode config.ApprovalMode) loop.Approver {
+	switch mode {
 	case config.ApprovalManual:
-		approver = loop.ManualApprover{}
+		return loop.ManualApprover{}
 	case config.ApprovalModel:
 		// 复用对话用的默认 Runner 当判官：零额外配置成本。
 		// 如果将来想用更便宜的模型专门当判官，可以在这里按
 		// 一个独立的模型配置 ID 解析出另一个 Runner 再传入。
-		approver = loop.ModelApprover{
+		return loop.ModelApprover{
 			Judge:      s.runner,
 			Timeout:    s.cfg.JudgeTimeout,
 			FailClosed: !s.cfg.JudgeFailOpen,
 		}
 	default: // config.ApprovalAuto
-		approver = loop.AutoApprover{
+		return loop.AutoApprover{
 			AllowModerate:  true,
 			AllowDangerous: s.cfg.EnableCommandTool,
 		}
 	}
-	s.exec.SetTools(registry, systemPrompt, maxSteps, timeout, approver)
-	s.tools = registry
+}
+
+// ApprovalMode 返回当前生效的审批模式（供 GET /api/approval-mode 用）。
+//
+// 未调用过 SetTools（工具系统未启用）时返回空字符串，由 handler 决定
+// 如何呈现——"没有工具"和"有工具但审批模式未知"是两种不同的状态，
+// 不应该在这里强行伪造一个默认值掩盖过去。
+func (s *Server) ApprovalMode() config.ApprovalMode {
+	s.approvalMu.RLock()
+	defer s.approvalMu.RUnlock()
+	return s.approvalMode
+}
+
+// SetApprovalMode 运行时切换审批模式，立即对后续的工具调用生效。
+//
+// 为什么不需要重启：三种 Approver 都是无状态的纯函数式对象（ManualApprover
+// 甚至是空 struct），切换只是换一个实现，不涉及已挂起任务的历史数据——
+// 已经处于 AwaitingHuman 挂起态的调用，其审批结果已经写进 checkpoint，
+// 不会被这次切换影响；只有"切换之后新发起的" evaluateApprovals 才会
+// 看到新的 Approver。
+//
+// 要求工具系统已启用（s.tools != nil），否则没有 Approver 可言，
+// 返回明确错误而不是静默忽略。
+func (s *Server) SetApprovalMode(mode config.ApprovalMode) error {
+	normalized, err := config.NormalizeApprovalMode(string(mode))
+	if err != nil {
+		return err
+	}
+	if s.tools == nil {
+		return fmt.Errorf("工具系统未启用，无法设置审批模式")
+	}
+	approver := s.buildApprover(normalized)
+	s.exec.SetApprover(approver)
+	s.approvalMu.Lock()
+	s.approvalMode = normalized
+	s.approvalMu.Unlock()
+	return nil
 }
 
 // Tools 返回当前工具注册表（可为 nil）。

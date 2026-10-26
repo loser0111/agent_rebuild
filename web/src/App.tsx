@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { ChatProvider, useChat } from './state/chatStore'
 import { ModelsProvider } from './state/modelsStore'
+import { ApprovalModeProvider } from './state/approvalModeStore'
 import { Sidebar } from './components/Sidebar'
 import { ChatView } from './components/ChatView'
 import { Composer } from './components/Composer'
@@ -30,9 +31,11 @@ export default function App() {
   const desktop = isDesktop()
   return (
     <ModelsProvider>
-      <ChatProvider>
-        <Shell desktop={desktop} />
-      </ChatProvider>
+      <ApprovalModeProvider>
+        <ChatProvider>
+          <Shell desktop={desktop} />
+        </ChatProvider>
+      </ApprovalModeProvider>
     </ModelsProvider>
   )
 }

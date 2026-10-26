@@ -2005,6 +2005,22 @@ kbd {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+/* 审批模式切换器的风险色点：manual 用默认灰/绿，model 黄，auto 红——
+   越靠右越危险，与 ApprovalCard 的风险徽章配色保持一致。 */
+.model-dot.is-warn {
+  background: var(--warn);
+  box-shadow: 0 0 0 3px var(--warn-soft);
+}
+
+.model-dot.is-danger {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+
+.approval-mode-picker .model-picker-btn {
+  max-width: 180px;
+}
+
 /* ---- 下拉菜单 ---- */
 
 .model-menu {

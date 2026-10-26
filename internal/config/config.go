@@ -33,10 +33,13 @@ const (
 	ApprovalAuto ApprovalMode = "auto"
 )
 
-// normalizeApprovalMode 校验并归一化 APPROVAL_MODE 的取值。
+// NormalizeApprovalMode 校验并归一化 APPROVAL_MODE 的取值。
 // 无法识别的值会被拒绝（快速失败），而不是静默回退到某个默认值——
 // 审批模式配错是安全相关的问题，不该被"拼写错误也能跑起来"掩盖。
-func normalizeApprovalMode(raw string) (ApprovalMode, error) {
+//
+// 导出（大写开头）是因为 API 层运行时切换审批模式（POST /api/approval-mode）
+// 需要复用同一份校验逻辑，而不是在 internal/api 里再抄一份 switch。
+func NormalizeApprovalMode(raw string) (ApprovalMode, error) {
 	switch ApprovalMode(strings.ToLower(strings.TrimSpace(raw))) {
 	case ApprovalManual:
 		return ApprovalManual, nil
@@ -135,7 +138,7 @@ func Load() (*Config, error) {
 
 	// 审批模式单独解析校验：配错值要快速失败，而不是静默退到某个默认值
 	// （审批模式是安全相关的开关，拼写错误不该被悄悄吞掉）。
-	approvalMode, err := normalizeApprovalMode(envString("APPROVAL_MODE", string(ApprovalManual)))
+	approvalMode, err := NormalizeApprovalMode(envString("APPROVAL_MODE", string(ApprovalManual)))
 	if err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
