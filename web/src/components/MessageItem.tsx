@@ -1,21 +1,32 @@
 import { useMemo, useState } from 'react'
-import type { Message } from '../api/types'
+import type { Message, ToolCallView } from '../api/types'
 import { Markdown } from './Markdown'
 import { useChat } from '../state/chatStore'
 import { ToolCallSummary } from './ToolCallCard'
 
 /** 单条消息：用户气泡 / 助手气泡（Markdown + 工具调用 + 复制 + 状态标记）。 */
-export function MessageItem({ message }: { message: Message }) {
+export function MessageItem({
+  message,
+  calls,
+}: {
+  message: Message
+  /** 归属本轮的调用（由 ChatView 按轮次聚合后传入，可能跨多条占位消息）。 */
+  calls?: ToolCallView[]
+}) {
   const { streamingMessageId, toolCalls, pendingQuestions } = useChat()
   const isUser = message.role === 'user'
   const streaming = streamingMessageId === message.id
   const [copied, setCopied] = useState(false)
 
-  // 只取归属当前这条消息的工具调用，保持到达顺序。
-  const calls = useMemo(
-    () => Object.values(toolCalls).filter((c) => c.message_id === message.id),
-    [toolCalls, message.id],
-  )
+  // 兜底：调用方没传时按 message_id 自行过滤。
+  //
+  // 但这条路径只适合「一轮只有一条 assistant」的简单场景；
+  // 挂起→恢复会产生两条占位消息，必须靠 ChatView 传聚合结果，
+  // 否则同一轮会被拆成两个气泡。
+  const ownCalls = useMemo(() => {
+    if (calls) return calls
+    return Object.values(toolCalls).filter((c) => c.message_id === message.id)
+  }, [calls, toolCalls, message.id])
 
   const copy = async () => {
     try {
@@ -57,7 +68,7 @@ export function MessageItem({ message }: { message: Message }) {
         {awaiting && <span className="tag-awaiting">等待回答</span>}
         {streaming && !awaiting && <span className="tag-running">生成中</span>}
         {/* 工具调用折叠成一行摘要，挂在 Agent 标签右侧 */}
-        {calls.length > 0 && <ToolCallSummary calls={calls} />}
+        {ownCalls.length > 0 && <ToolCallSummary calls={ownCalls} />}
       </div>
 
       <div className="msg-body">
@@ -71,7 +82,7 @@ export function MessageItem({ message }: { message: Message }) {
           </div>
         ) : empty && message.status === 'error' ? (
           <div className="msg-error">{message.error?.message ?? '生成失败'}</div>
-        ) : empty && calls.length > 0 ? (
+        ) : empty && ownCalls.length > 0 ? (
           <div className="tool-pending">
             {message.status === 'interrupted' ? '（本轮被中断，未产生文字回答）' : '（本轮未产生文字回答）'}
           </div>

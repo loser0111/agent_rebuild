@@ -91,6 +91,7 @@ test-web:
 	cd $(WEB_DIR) && node --experimental-strip-types scripts/verify-ask-user-fixes.mjs
 	cd $(WEB_DIR) && node scripts/verify-ask-answer.mjs
 	cd $(WEB_DIR) && node scripts/verify-multi-question.mjs
+	cd $(WEB_DIR) && node --experimental-strip-types scripts/verify-bubble-merge.mjs
 	cd $(WEB_DIR) && node scripts/verify-tool-events.mjs
 	cd $(WEB_DIR) && node scripts/verify-tool-summary.mjs
 	cd $(WEB_DIR) && node scripts/verify-ask-user.mjs

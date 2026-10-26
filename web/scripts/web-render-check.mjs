@@ -22,6 +22,7 @@ const { Composer } = await import('../src/components/Composer.tsx')
 const { StatusBar } = await import('../src/components/StatusBar.tsx')
 const { MessageItem } = await import('../src/components/MessageItem.tsx')
 const { AskUserCard } = await import('../src/components/AskUserCard.tsx')
+const { hostMap } = await import('../src/state/toolRestore.ts')
 const { Markdown, CodeBlock } = await import('../src/components/Markdown.tsx')
 
 let passed = 0
@@ -264,6 +265,43 @@ test('AskUserCard 在无提问时返回空', () => {
     h(ModelsProvider, null, h(ChatProvider, null, h(AskUserCard))),
   )
   if (html !== '') throw new Error(`无提问时应渲染空内容，实际: ${html}`)
+})
+
+test('同一轮的多个占位消息只渲染一个 Agent 气泡', () => {
+  // 复刻「挂起→恢复」产生的形态：一条 user 后面跟两条 assistant 占位。
+  // 若按 message_id 各自渲染，会出现两个「Agent」标题（截图里的现象）。
+  const user = mkMsg('u1', 'user', '问')
+  const holderA = mkMsg('a1', 'assistant', '', 'complete', {
+    tool_calls: [{ id: 'c_ask', name: 'ask_user', args: '{}' }],
+  })
+  const holderB = mkMsg('a2', 'assistant', '最终回答', 'complete', {
+    tool_calls: [{ id: 'c_read', name: 'read_file', args: '{}' }],
+  })
+
+  // ChatView 内部按 hostMap 过滤；这里直接验证 hostMap 的判定结果。
+  const hosts = hostMap([user, holderA, holderB])
+  if (hosts.a1 !== 'a2') {
+    throw new Error(`占位 A 应归到 B（实际 ${hosts.a1}）`)
+  }
+  if (hosts.a2 !== 'a2') {
+    throw new Error(`B 应是自己（实际 ${hosts.a2}）`)
+  }
+  // 用户消息也参与「本轮宿主」映射（同轮的工具卡片要归到那一轮），
+  // 但 ChatView 只对 assistant 做跳过判断，user 不受影响。
+  if (hosts.u1 !== 'a2') {
+    throw new Error(`user 消息归到本轮宿主（实际 ${hosts.u1}）`)
+  }
+})
+
+test('不同轮次不会被合并', () => {
+  const u1 = mkMsg('u1', 'user', '第一问')
+  const a1 = mkMsg('a1', 'assistant', '第一答')
+  const u2 = mkMsg('u2', 'user', '第二问')
+  const a2 = mkMsg('a2', 'assistant', '第二答')
+  const hosts = hostMap([u1, a1, u2, a2])
+  if (hosts.a1 === hosts.a2) {
+    throw new Error('不同轮次被错误合并')
+  }
 })
 
 console.log(`\n✅ 组件渲染检查通过（${passed} 项）\n`)

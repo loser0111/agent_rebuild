@@ -43,6 +43,64 @@ export function turnHosts(messages: Message[]): string[] {
 }
 
 /**
+ * 把（实时收到的）工具调用按「轮次宿主」分组，供渲染使用。
+ *
+ * 为什么需要它：挂起→恢复会新建一条 assistant 占位消息，
+ * 于是同一轮里出现两条 assistant：
+ *
+ *   占位 A（挂起时那一轮）→ ask_user 卡片
+ *   占位 B（resume 之后）  → read_file/search 卡片 + 最终回答
+ *
+ * 若各按自己的 message_id 渲染，用户就会看到两个「Agent」气泡，
+ * 明明是同一轮对话却被劈成两半。而刷新后用的 rebuildToolCalls
+ * 是按轮次聚合的，只显示一个气泡——实时与刷新不一致本身就是 bug。
+ *
+ * 这里复用同一套 turnHosts 规则，把实时数据也归到轮次宿主上，
+ * 保证两种视图完全一致。
+ */
+export function groupCallsByHost(
+  messages: Message[],
+  calls: ToolCallView[],
+): Record<string, ToolCallView[]> {
+  const out: Record<string, ToolCallView[]> = {}
+  if (messages.length === 0 || calls.length === 0) return out
+
+  const indexOf = new Map(messages.map((m, i) => [m.id, i]))
+  const hosts = turnHosts(messages)
+
+  for (const c of calls) {
+    const idx = indexOf.get(c.message_id)
+    // 归属消息已不存在（被裁剪、或 id 对不上）时退回到自身，
+    // 宁可单独显示也不要让卡片凭空消失。
+    const hostId = idx === undefined ? c.message_id : hosts[idx] || messages[idx].id
+    if (!hostId) continue
+    ;(out[hostId] ??= []).push(c)
+  }
+  return out
+}
+
+/**
+ * 计算「哪条消息是本轮的宿主」的映射（messageId → 宿主 messageId）。
+ *
+ * ChatView 用它跳过同轮里多余的那条 assistant 占位消息，
+ * 保证一轮只渲染一个 Agent 气泡。
+ *
+ * 与 groupCallsByHost 分开是刻意的：后者在「有工具调用」时才需要，
+ * 而跳过多余气泡在**没有**工具调用时同样要生效
+ * （例如挂起后用户直接结束，只留下两条空占位）。
+ */
+export function hostMap(messages: Message[]): Record<string, string> {
+  const out: Record<string, string> = {}
+  if (messages.length === 0) return out
+  const hosts = turnHosts(messages)
+  for (let i = 0; i < messages.length; i++) {
+    const h = hosts[i]
+    if (h) out[messages[i].id] = h
+  }
+  return out
+}
+
+/**
  * 从历史消息还原工具调用视图。
  *
  * 后端把工具调用存成两类消息：

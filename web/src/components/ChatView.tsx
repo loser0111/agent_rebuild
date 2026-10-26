@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useChat } from '../state/chatStore'
+import { groupCallsByHost, hostMap } from '../state/toolRestore'
 import { MessageItem } from './MessageItem'
 
 /** 主对话区：消息流 + 自动滚动 + 空态。 */
@@ -27,6 +28,31 @@ export function ChatView() {
   useEffect(() => {
     setStuckToBottom(true)
   }, [currentId])
+
+  /**
+   * 按轮次把工具调用聚合到宿主消息上。
+   *
+   * 为什么不能在 MessageItem 里各自过滤（按 message_id）：
+   * 挂起→恢复会新建一条 assistant 占位消息，同一轮因此有两条：
+   *
+   *   占位 A（挂起那轮）→ ask_user 卡片
+   *   占位 B（resume 后）→ read_file/search 卡片 + 最终回答
+   *
+   * 各按自己的 id 渲染就会出现两个「Agent」气泡，把同一轮劈成两半
+   * （截图里的现象）。而刷新后走的 rebuildToolCalls 是按轮次聚合的，
+   * 只显示一个气泡——实时与刷新必须一致。
+   */
+  const callsByHost = useMemo(
+    () => groupCallsByHost(messages, Object.values(toolCalls)),
+    [messages, toolCalls],
+  )
+
+  /** 汇总到某条消息名下的工具调用（可能来自同轮的其他占位消息）。 */
+  const callsFor = (messageId: string) => callsByHost[messageId] ?? []
+
+  /** 消息 → 本轮宿主消息 id（用于跳过同轮多余的占位气泡）。 */
+  const hosts = useMemo(() => hostMap(messages), [messages])
+  const hostOf = (messageId: string) => hosts[messageId] || messageId
 
   if (!currentId) {
     return (
@@ -82,15 +108,18 @@ export function ChatView() {
           // 否则内容会重复出现一遍。
           if (m.role === 'tool') return null
 
-          // 「只带 tool_calls、content 为空」的 assistant 消息：
-          // 如果卡片挂在它身上（工具调用后没有最终回答）就必须渲染，
-          // 否则卡片会整个消失；挂在后续回答上时才跳过。
-          if (m.role === 'assistant' && !m.content && m.tool_calls?.length) {
-            const hosted = Object.values(toolCalls).some((c) => c.message_id === m.id)
-            if (!hosted) return null
+          // 同一轮里的「非宿主」assistant 消息不再单独渲染。
+          //
+          // 典型场景：挂起时占位 A 承载 ask_user 卡片，resume 后新建的
+          // 占位 B 承载后续工具调用与最终回答。A 与 B 属于同一轮
+          // （中间没有新的 user 消息），必须合并成一个 Agent 气泡，
+          // 否则界面上会出现两个「Agent」标题，把一轮对话劈成两半。
+          if (m.role === 'assistant') {
+            const hostId = hostOf(m.id)
+            if (hostId && hostId !== m.id) return null
           }
 
-          return <MessageItem key={m.id} message={m} />
+          return <MessageItem key={m.id} message={m} calls={callsFor(m.id)} />
         })}
 
         {isStreaming && <div className="chat-tail-spacer" />}
