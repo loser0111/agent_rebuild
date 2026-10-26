@@ -2,11 +2,11 @@ import { useMemo, useState } from 'react'
 import type { Message } from '../api/types'
 import { Markdown } from './Markdown'
 import { useChat } from '../state/chatStore'
-import { ToolCallList } from './ToolCallCard'
+import { ToolCallSummary } from './ToolCallCard'
 
 /** 单条消息：用户气泡 / 助手气泡（Markdown + 工具调用 + 复制 + 状态标记）。 */
 export function MessageItem({ message }: { message: Message }) {
-  const { streamingMessageId, toolCalls } = useChat()
+  const { streamingMessageId, toolCalls, pendingQuestions } = useChat()
   const isUser = message.role === 'user'
   const streaming = streamingMessageId === message.id
   const [copied, setCopied] = useState(false)
@@ -43,6 +43,9 @@ export function MessageItem({ message }: { message: Message }) {
   }
 
   const empty = !message.content
+  // 这一轮是否在等用户回答（ask_user 挂起）。
+  // 只认「当前挂起」这一条，历史里已答过的轮次不再提示。
+  const awaiting = pendingQuestions.length > 0 && streaming
 
   return (
     <div className="msg msg-assistant">
@@ -51,14 +54,16 @@ export function MessageItem({ message }: { message: Message }) {
         <span>Agent</span>
         {message.status === 'interrupted' && <span className="tag-warn">已中断</span>}
         {message.status === 'error' && <span className="tag-error">失败</span>}
-        {streaming && <span className="tag-running">生成中</span>}
+        {awaiting && <span className="tag-awaiting">等待回答</span>}
+        {streaming && !awaiting && <span className="tag-running">生成中</span>}
+        {/* 工具调用折叠成一行摘要，挂在 Agent 标签右侧 */}
+        {calls.length > 0 && <ToolCallSummary calls={calls} />}
       </div>
 
       <div className="msg-body">
-        {/* 工具调用在文字之前：模型先调工具、拿到结果后才开始组织回答 */}
-        {calls.length > 0 && <ToolCallList calls={calls} />}
-
-        {empty && streaming ? (
+        {empty && streaming && awaiting ? (
+          <div className="tool-pending">（已向用户提问，等待回答后继续）</div>
+        ) : empty && streaming ? (
           <div className="typing">
             <span />
             <span />
@@ -66,7 +71,11 @@ export function MessageItem({ message }: { message: Message }) {
           </div>
         ) : empty && message.status === 'error' ? (
           <div className="msg-error">{message.error?.message ?? '生成失败'}</div>
-        ) : empty && calls.length > 0 ? null : (
+        ) : empty && calls.length > 0 ? (
+          <div className="tool-pending">
+            {message.status === 'interrupted' ? '（本轮被中断，未产生文字回答）' : '（本轮未产生文字回答）'}
+          </div>
+        ) : (
           <>
             <Markdown text={message.content} streaming={streaming} />
             {streaming && <span className="caret" />}

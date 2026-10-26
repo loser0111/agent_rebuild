@@ -38,6 +38,14 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{id}/cancel", s.handleCancel)
 	mux.HandleFunc("/api/sessions/{id}/cancel", methodNotAllowed("POST"))
 
+	// 会话恢复：回答挂起中的提问并继续生成（ask_user）。
+	mux.HandleFunc("POST /api/sessions/{id}/resume", s.handleResume)
+	mux.HandleFunc("/api/sessions/{id}/resume", methodNotAllowed("POST"))
+
+	// 查询是否有挂起中的提问（前端刷新后据此恢复问答卡片）。
+	mux.HandleFunc("GET /api/sessions/{id}/checkpoint", s.handleGetCheckpoint)
+	mux.HandleFunc("/api/sessions/{id}/checkpoint", methodNotAllowed("GET"))
+
 	// 模型配置（多模型支持；需要 STORE_DRIVER=sqlite）
 	mux.HandleFunc("GET /api/models", s.handleListModelConfigs)
 	mux.HandleFunc("POST /api/models", s.handleCreateModelConfig)

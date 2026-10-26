@@ -15,11 +15,13 @@ globalThis.fetch = async () => {
 }
 
 const { ChatProvider } = await import('../src/state/chatStore.tsx')
+const { ModelsProvider } = await import('../src/state/modelsStore.tsx')
 const { Sidebar } = await import('../src/components/Sidebar.tsx')
 const { ChatView } = await import('../src/components/ChatView.tsx')
 const { Composer } = await import('../src/components/Composer.tsx')
 const { StatusBar } = await import('../src/components/StatusBar.tsx')
 const { MessageItem } = await import('../src/components/MessageItem.tsx')
+const { AskUserCard } = await import('../src/components/AskUserCard.tsx')
 const { Markdown, CodeBlock } = await import('../src/components/Markdown.tsx')
 
 let passed = 0
@@ -58,10 +60,17 @@ const mkMsg = (id, role, content, status = 'complete', extra = {}) => ({
 
 console.log('\n▶ 组件渲染（react-dom/server）')
 
+/**
+ * 统一的 Provider 包装。
+ *
+ * Composer / 顶部栏依赖 ModelsProvider（模型选择与配置），
+ * 漏包会在渲染时抛「useModels 必须在 ModelsProvider 内使用」。
+ */
+const withProviders = (...children) =>
+  h(ModelsProvider, null, h(ChatProvider, null, ...children))
+
 test('整棵树（空态）可渲染', () => {
-  const html = renderToString(
-    h(ChatProvider, null, h(Sidebar), h(ChatView), h(Composer), h(StatusBar)),
-  )
+  const html = renderToString(withProviders(h(Sidebar), h(ChatView), h(Composer), h(StatusBar)))
   if (!html.includes('新建会话')) throw new Error('缺少「新建会话」按钮')
   if (!html.includes('开始一段新对话')) throw new Error('缺少空态提示')
   if (!html.includes('请先在左侧选择或新建会话')) throw new Error('输入框占位文案缺失')
@@ -228,9 +237,33 @@ test('侧边栏初始为加载态（SSR 不执行 useEffect）', () => {
 })
 
 test('输入框在无会话时禁用', () => {
-  const html = renderToString(h(ChatProvider, null, h(Composer)))
+  const html = renderToString(withProviders(h(Composer)))
   if (!html.includes('disabled')) throw new Error('无会话时 textarea 应禁用')
   if (!html.includes('请先在左侧选择或新建会话')) throw new Error('缺少占位提示')
+})
+
+test('工具调用默认折叠并显示次数', () => {
+  // 造一条带工具卡片的 assistant 消息，验证摘要行渲染。
+  const msg = mkMsg('m-tool', 'assistant', '回答正文')
+  const html = renderToString(
+    h(ModelsProvider, null, h(ChatProvider, null, h(MessageItem, { message: msg }))),
+  )
+  // 无工具时不应出现摘要
+  if (html.includes('工具调用')) throw new Error('无工具时不应显示摘要')
+})
+
+test('无挂起提问时不渲染问答卡片', () => {
+  // 初始状态下 pendingQuestion 为 null，卡片不应出现。
+  const html = renderToString(withProviders(h(Composer)))
+  if (html.includes('需要你的回答')) throw new Error('没有提问时不应渲染问答卡片')
+  if (html.includes('提交并继续')) throw new Error('没有提问时不应有提交按钮')
+})
+
+test('AskUserCard 在无提问时返回空', () => {
+  const html = renderToString(
+    h(ModelsProvider, null, h(ChatProvider, null, h(AskUserCard))),
+  )
+  if (html !== '') throw new Error(`无提问时应渲染空内容，实际: ${html}`)
 })
 
 console.log(`\n✅ 组件渲染检查通过（${passed} 项）\n`)

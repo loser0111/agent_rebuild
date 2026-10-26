@@ -1,6 +1,7 @@
 /* REST 客户端封装：统一错误处理，不引入 axios。 */
 import type {
   ApiError,
+  CheckpointResponse,
   CreateSessionResponse,
   HealthResponse,
   ListSessionsResponse,
@@ -97,7 +98,22 @@ export const api = {
     request<void>(`/sessions/${id}`, { method: 'DELETE' }),
 
   cancel: (id: string) =>
-    request<{ canceled: boolean }>(`/sessions/${id}/cancel`, { method: 'POST' }),
+    request<{ canceled: boolean; status_reset?: boolean }>(`/sessions/${id}/cancel`, {
+      method: 'POST',
+    }),
+
+  /* ---- 等待用户回答（ask_user）---- */
+
+  /** 查询会话是否有挂起中的提问（刷新页面后恢复问答卡片）。 */
+  getCheckpoint: (id: string) => request<CheckpointResponse>(`/sessions/${id}/checkpoint`),
+
+  /**
+   * 回答挂起中的提问并继续生成。
+   *
+   * 走 SSE：后端会先补一条 tool 结果，再重新进入工具循环，
+   * 后续的文本增量与正常回答一致。
+   */
+  resumeUrl: (id: string) => `${BASE}/sessions/${id}/resume`,
 
   /* ---- 模型配置 ---- */
 

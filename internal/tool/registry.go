@@ -77,6 +77,12 @@ func DefaultRegistry(opts Options) *Registry {
 		NewSearchTool(root),
 	)
 
+	// 交互工具：让模型能主动向用户提问（挂起等待回答）。
+	//
+	// 只读模式下也注册：它不读不写任何资源，只是发起一次提问，
+	// 而「信息不足时该问而不是猜」在只读场景同样成立。
+	reg.Register(NewAskUserTool())
+
 	if opts.ReadOnly {
 		slog.Info("工具集为只读模式", "workspace", root, "count", reg.Len())
 		return reg

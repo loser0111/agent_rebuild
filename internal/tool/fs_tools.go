@@ -29,6 +29,18 @@ const (
 	maxListEntries  = 500
 	maxSearchResult = 200
 	maxLineLen      = 500 // 单行最大显示长度
+
+	// defaultReadLines 是 read_file 未指定 limit 时的默认读取行数。
+	//
+	// 为什么要有默认值：不限制时模型很容易一次性读入几千行的大文件，
+	// 既撑爆上下文（30k 字符上限照样被瞬间打满），又拿不到文件全貌，
+	// 于是换个文件再读一遍——几轮就把步数耗尽。
+	// 限制默认窗口后，模型必须先看文件头部、再按需 offset 定位，
+	// 单个文件的 token 成本可控。
+	defaultReadLines = 200
+
+	// 未指定 limit 且文件超过该行数时，提示模型后续如何读取。
+	readHintThreshold = defaultReadLines
 )
 
 // fsConfig 是文件工具的公共配置。
@@ -93,18 +105,20 @@ func NewReadFileTool(root string) Tool {
 func (t *readFileTool) Spec() Spec {
 	return Spec{
 		Name: "read_file",
-		Description: "读取文件内容，返回带行号的文本。用于了解代码或配置的现状。" +
-			"大文件可用 offset/limit 分段读取（行号从 1 开始）。" +
-			"修改文件前应先读取它。",
-		Parameters: json.RawMessage(`{
+		Description: fmt.Sprintf(
+			"读取文件内容，返回带行号的文本。用于了解代码或配置的现状；修改文件前应先读取它。"+
+				"未指定 limit 时默认只返回前 %d 行（大文件请用 offset/limit 精准定位，"+
+				"不要反复整篇读取同一个文件）。读完会明确告知是否已到文件末尾。",
+			defaultReadLines),
+		Parameters: json.RawMessage(fmt.Sprintf(`{
 			"type":"object",
 			"properties":{
 				"path":{"type":"string","description":"相对于工作目录的文件路径"},
 				"offset":{"type":"integer","description":"起始行号（从 1 开始），可选"},
-				"limit":{"type":"integer","description":"最多读取行数，可选"}
+				"limit":{"type":"integer","description":"最多读取行数，默认 %d"}
 			},
 			"required":["path"]
-		}`),
+		}`, defaultReadLines)),
 		Risk: RiskSafe,
 	}
 }
@@ -147,6 +161,13 @@ func (t *readFileTool) Execute(ctx context.Context, raw json.RawMessage) (Result
 	if offset < 0 {
 		offset = 0
 	}
+	// limit<=0 时套用默认窗口（而不是不限），避免整篇读入大文件。
+	limit := args.Limit
+	explicitLimit := limit > 0
+	if limit <= 0 {
+		limit = defaultReadLines
+	}
+
 	var sb strings.Builder
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
@@ -154,13 +175,18 @@ func (t *readFileTool) Execute(ctx context.Context, raw json.RawMessage) (Result
 	lineNo := 0
 	written := 0
 	truncated := false
+	hitDefaultWindow := false
+	lastLine := 0
 	for scanner.Scan() {
 		lineNo++
 		if offset > 0 && lineNo < offset {
 			continue
 		}
-		if args.Limit > 0 && written >= args.Limit {
+		if written >= limit {
 			truncated = true
+			if !explicitLimit {
+				hitDefaultWindow = true
+			}
 			break
 		}
 		line := scanner.Text()
@@ -169,6 +195,7 @@ func (t *readFileTool) Execute(ctx context.Context, raw json.RawMessage) (Result
 		}
 		fmt.Fprintf(&sb, "%6d\t%s\n", lineNo, line)
 		written++
+		lastLine = lineNo
 
 		// 字符级上限保护。
 		if sb.Len() > t.cfg.maxReadCharsOrDefault() {
@@ -188,8 +215,21 @@ func (t *readFileTool) Execute(ctx context.Context, raw json.RawMessage) (Result
 
 	out := sb.String()
 	if truncated {
-		out += fmt.Sprintf("\n... 输出已截断（已读到第 %d 行）。可用 offset=%d 继续读取。\n",
-			lineNo, lineNo+1)
+		if hitDefaultWindow {
+			// 默认窗口结束：明确告诉模型这是「分段读取」而非异常截断，
+			// 并给出下一次的 offset，避免它从头重读整个文件。
+			out += fmt.Sprintf(
+				"\n... 已显示第 %d-%d 行（默认每次最多 %d 行）。"+
+					"需要后续内容请用 offset=%d 继续读取，不要重读前面的部分。\n",
+				offset+1, lastLine, defaultReadLines, lastLine+1)
+		} else {
+			out += fmt.Sprintf("\n... 输出已截断（已读到第 %d 行）。可用 offset=%d 继续读取。\n",
+				lastLine, lastLine+1)
+		}
+	} else if offset == 0 && lineNo <= limit {
+		// 完整读完的小文件：明确告知「已到文件末尾」，
+		// 防止模型再调一次确认。
+		out += fmt.Sprintf("\n... 文件已全部读取（共 %d 行）。\n", lineNo)
 	}
 	return Result{Output: out, Truncated: truncated}, nil
 }

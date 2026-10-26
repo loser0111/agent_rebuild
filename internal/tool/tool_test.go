@@ -39,11 +39,11 @@ func invoke(t *testing.T, reg *Registry, name string, args any) Result {
 func TestDefaultRegistryTools(t *testing.T) {
 	reg, _ := newTestRegistry(t, false)
 
-	// 默认应包含 5 个工具（不含命令执行）。
-	if reg.Len() != 5 {
-		t.Fatalf("工具数 = %d，期望 5：%v", reg.Len(), reg.Names())
+	// 默认应包含 6 个工具（不含命令执行）：5 个文件/搜索工具 + ask_user。
+	if reg.Len() != 6 {
+		t.Fatalf("工具数 = %d，期望 6：%v", reg.Len(), reg.Names())
 	}
-	for _, want := range []string{"read_file", "write_file", "edit_file", "list_dir", "search"} {
+	for _, want := range []string{"read_file", "write_file", "edit_file", "list_dir", "search", "ask_user"} {
 		if _, ok := reg.Get(want); !ok {
 			t.Fatalf("缺少工具 %q，实际: %v", want, reg.Names())
 		}
@@ -64,11 +64,17 @@ func TestCommandToolOptIn(t *testing.T) {
 func TestReadOnlyMode(t *testing.T) {
 	root := t.TempDir()
 	reg := DefaultRegistry(Options{Workspace: root, ReadOnly: true})
-	if reg.Len() != 3 {
-		t.Fatalf("只读模式工具数 = %d，期望 3", reg.Len())
+	// 只读模式下仍是 4 个：3 个读取类 + ask_user。
+	// ask_user 不读不写任何资源，只发起一次提问，因此不受只读限制。
+	if reg.Len() != 4 {
+		t.Fatalf("只读模式工具数 = %d，期望 4：%v", reg.Len(), reg.Names())
 	}
 	if _, ok := reg.Get("write_file"); ok {
 		t.Fatal("只读模式不应有写工具")
+	}
+	// 但提问能力应该保留：信息不足时该问而不是猜。
+	if _, ok := reg.Get("ask_user"); !ok {
+		t.Fatal("只读模式仍应保留 ask_user")
 	}
 }
 

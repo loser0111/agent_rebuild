@@ -87,6 +87,13 @@ test:
 .PHONY: test-web
 test-web:
 	node --experimental-strip-types scripts/web-smoke.mjs
+	cd $(WEB_DIR) && node --experimental-strip-types scripts/verify-tool-restore.mjs
+	cd $(WEB_DIR) && node --experimental-strip-types scripts/verify-ask-user-fixes.mjs
+	cd $(WEB_DIR) && node scripts/verify-ask-answer.mjs
+	cd $(WEB_DIR) && node scripts/verify-multi-question.mjs
+	cd $(WEB_DIR) && node scripts/verify-tool-events.mjs
+	cd $(WEB_DIR) && node scripts/verify-tool-summary.mjs
+	cd $(WEB_DIR) && node scripts/verify-ask-user.mjs
 	cd $(WEB_DIR) && node scripts/run-render-check.mjs
 
 ## test-all: Go + 前端全部检查
@@ -108,6 +115,16 @@ smoke:
 .PHONY: e2e
 e2e: build-web
 	@START_SERVER=1 PORT=$(PORT) bash scripts/e2e.sh
+
+## e2e-ask-user: ask_user 跨进程恢复验证（提问→kill -9→重启→resume）
+.PHONY: e2e-ask-user
+e2e-ask-user:
+	@bash scripts/e2e-ask-user.sh
+
+## e2e-multi-question: 一次 ask_user 问多个问题（减少往返）
+.PHONY: e2e-multi-question
+e2e-multi-question:
+	@bash scripts/e2e-multi-question.sh
 
 ## demo: 构建并启动单端口 Demo（浏览器访问 http://localhost:8080）
 .PHONY: demo

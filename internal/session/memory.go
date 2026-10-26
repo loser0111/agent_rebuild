@@ -300,6 +300,32 @@ func (s *MemoryStore) Messages(ctx context.Context, sessionID string) ([]Message
 	return out, nil
 }
 
+// RecoverStaleRunning 把卡在 running 的会话复位为 idle。
+//
+// 内存存储在进程重启后本就什么都不剩，这里主要为了满足接口契约
+// （contract_test 对所有实现一视同仁）。同进程内仍可能有需要复位的
+// 场景：任务 goroutine 异常退出但没走到 finish。
+func (s *MemoryStore) RecoverStaleRunning(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	n := 0
+	now := s.now()
+	for id, sess := range s.sessions {
+		if sess.Status != SessionRunning {
+			continue
+		}
+		sess.Status = SessionIdle
+		sess.UpdatedAt = now
+		s.sessions[id] = sess
+		n++
+	}
+	return n, nil
+}
+
 // Snapshot 导出一份深拷贝的全量状态，可用于落盘或迁移到其他实现。
 func (s *MemoryStore) Snapshot(ctx context.Context) (*Snapshot, error) {
 	if err := ctx.Err(); err != nil {

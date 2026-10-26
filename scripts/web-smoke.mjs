@@ -66,11 +66,13 @@ test('无序与有序列表', () => {
   const ul = parseBlocks('- a\n- b')
   assert.equal(ul[0].kind, 'list')
   assert.equal(ul[0].ordered, false)
-  assert.deepEqual(ul[0].items, ['a', 'b'])
+  // items 是 ListItem 对象（支持嵌套与任务列表），不是裸字符串。
+  assert.deepEqual(ul[0].items.map((it) => it.text), ['a', 'b'])
+  assert.deepEqual(ul[0].items.map((it) => it.checked), [null, null])
 
   const ol = parseBlocks('1. x\n2. y')
   assert.equal(ol[0].ordered, true)
-  assert.deepEqual(ol[0].items, ['x', 'y'])
+  assert.deepEqual(ol[0].items.map((it) => it.text), ['x', 'y'])
 })
 
 test('列表不会被后续段落吞掉', () => {

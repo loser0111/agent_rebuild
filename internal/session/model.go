@@ -32,6 +32,13 @@ const (
 	SessionIdle    SessionStatus = "idle"
 	SessionRunning SessionStatus = "running"
 	SessionError   SessionStatus = "error"
+	// SessionSuspended 会话挂起：agent 正在等用户回答（ask_user）。
+	//
+	// 与前两者的关键区别：它不是「进程内有任务在跑」（running），
+	// 也不是「可以自由发新消息」（idle），而是「等某个特定回答」。
+	// 因此 RecoverStaleRunning 不能把它复位成 idle，否则用户重启后
+	// 就再也看不到那个待回答的问题了。
+	SessionSuspended SessionStatus = "suspended"
 )
 
 // Usage token 用量（assistant 消息 complete 时填充）。

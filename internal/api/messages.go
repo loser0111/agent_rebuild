@@ -417,6 +417,22 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, r, http.StatusAccepted, map[string]bool{"canceled": true})
 		return
 	}
-	// 没有运行中的生成：幂等返回 canceled=false。
-	respondJSON(w, r, http.StatusOK, map[string]bool{"canceled": false})
+
+	// 没有运行中的任务，但会话可能残留 running 状态（进程异常退出导致）。
+	// 此时用户点"停止"的真实意图是"让我能继续用这个会话"，因此顺手复位，
+	// 否则前端会一直显示"生成中"且无法再发消息。
+	reset, err := s.store.Update(r.Context(), sessionID, func(sc *session.Session) error {
+		if sc.Status == session.SessionRunning {
+			sc.Status = session.SessionIdle
+		}
+		return nil
+	})
+	if err != nil {
+		s.respondStoreError(w, r, err)
+		return
+	}
+	respondJSON(w, r, http.StatusOK, map[string]bool{
+		"canceled":     false,
+		"status_reset": reset.Status == session.SessionIdle,
+	})
 }

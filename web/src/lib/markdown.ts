@@ -385,22 +385,39 @@ export function parseInline(src: string, trailing = false): Inline[] {
 /**
  * 去掉末尾未闭合的 Markdown 标记符号（流式渲染专用）。
  *
- * 例：`消息：*` → `消息：`，``看 `co`` → `看 `。
+ * 例：`消息：*` → `消息：`，``看 `co`` → `看 co`。
  * 这样逐字渲染时不会出现半截 `**` 或反引号闪烁。
+ *
+ * 只删**标记符号本身**，不删内容：流式输出到一半时，`co` 是模型真的
+ * 要说的话，吞掉它会导致文字闪一下又出现，比看到半截反引号更难受。
+ *
+ * 两种未闭合形态：
+ *  1. 标记滞留在末尾（`消息：*`、`强调**`）—— 剥掉尾部所有标记字符；
+ *  2. 标记在中间、后面还有内容（``看 `co``）—— 只删掉那个未配对的反引号。
  */
 function stripTrailingMarker(inlines: Inline[]): Inline[] {
   const copy = inlines.map((t) => ({ ...t }))
   const last = copy[copy.length - 1]
   if (!last || last.kind !== 'text') return copy
 
-  // 尾部可能堆叠多个标记字符，逐个剥掉。
-  const stripped = last.text.replace(/[`*_~[\]]+$/, '')
-  if (stripped === last.text) return copy
+  const before = last.text
+  let text = before
 
-  if (stripped === '') {
+  // 形态 1：尾部堆叠的标记字符（`**` 没有内容包住也算未闭合）。
+  text = text.replace(/[`*_~[\]]+$/, '')
+
+  // 形态 2：中间残留奇数个反引号 → 行内代码未闭合，删掉最后一个反引号。
+  const backticks = (text.match(/`/g) ?? []).length
+  if (backticks % 2 === 1) {
+    const i = text.lastIndexOf('`')
+    text = text.slice(0, i) + text.slice(i + 1)
+  }
+
+  if (text === before) return copy
+  if (text === '') {
     copy.pop()
   } else {
-    last.text = stripped
+    last.text = text
   }
   return copy
 }

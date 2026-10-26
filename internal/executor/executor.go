@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -173,6 +174,8 @@ type Executor struct {
 	maxSteps     int
 	toolTimeout  time.Duration
 	approver     loop.Approver
+	// checkpointer 断点存储（nil 表示不支持挂起等待用户回答）。
+	checkpointer session.CheckpointStore
 
 	mu    sync.Mutex
 	tasks map[string]*Task // sessionID -> Task
@@ -311,10 +314,49 @@ func (e *Executor) SetTools(registry *tool.Registry, systemPrompt string, maxSte
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.registry = registry
-	e.systemPrompt = systemPrompt
+	// 追加工具使用准则：模型（尤其小模型）拿到工具后极易反复试探同一个
+	// 文件、把 12 轮步数耗尽，最后什么结论都给不出。显式约束能显著减少
+	// 无效往返。
+	e.systemPrompt = withToolGuidance(systemPrompt)
 	e.maxSteps = maxSteps
 	e.toolTimeout = timeout
 	e.approver = approver
+}
+
+// SetCheckpointer 注入断点存储，启用「等待用户回答」能力。
+//
+// 单独一个 setter 而不是塞进 SetTools：不是所有部署形态都需要挂起
+// （例如内存存储的单进程 demo），把它做成可选依赖更贴合实际。
+func (e *Executor) SetCheckpointer(cp session.CheckpointStore) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.checkpointer = cp
+}
+
+// withToolGuidance 在用户系统提示后追加工具使用准则。
+//
+// 为什么放在代码里而不是只写文档：这是「不照做就明显变差」的行为约束，
+// 应该在所有部署形态下默认生效，而不是依赖用户手动配置。
+// 用户仍可通过 SYSTEM_PROMPT 覆盖自己的部分，但准则会保留。
+func withToolGuidance(base string) string {
+	guidance := strings.Join([]string{
+		"## 工具使用准则",
+		"",
+		"1. 先规划再动手：先用一次 list_dir 或 search 定位，不要逐个文件盲试。",
+		"2. 不要重复读取同一个文件。已经读过的内容就在上文，直接使用；",
+		"   需要该文件的其他部分时，用 offset/limit 精准读取，不要整篇重读。",
+		"3. 优先用 search 一次定位多处，再用 read_file 精读关键片段。",
+		"4. 工具结果足以回答时立刻给出答案，不要为了「再确认一下」继续调用。",
+		"5. 单个问题通常 3-5 次工具调用内就能回答；接近上限仍无结论时，",
+		"   应基于已有信息作答并说明还缺什么。",
+		"6. 工具报错时先读错误信息调整参数，不要用相同参数重试。",
+	}, "\n")
+
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return guidance
+	}
+	return base + "\n\n" + guidance
 }
 
 // ResolveRunner 按模型配置 ID 解析 Runner，供流式与非流式两条路径共用。
@@ -366,8 +408,13 @@ func (e *Executor) run(runCtx context.Context, task *Task, req Request, cancel c
 	}()
 
 	// 兜底落库用独立 ctx：执行 ctx 可能已取消，不能用它写库。
-	persistCtx, persistCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer persistCancel()
+	//
+	// 注意：这里**不能**用 defer cancel。streamEvents 内部有自己的
+	// goroutine 负责工具调用落库，外层函数返回时它可能还没写完；
+	// 若此时取消 persistCtx，就会得到 "context canceled" 而丢失
+	// 全部 tool_calls 与工具结果（历史里只剩普通文本，模型下次会重调工具）。
+	// 因此改为在启动 goroutine 结束后显式取消。
+	persistCtx, persistCancel := context.WithTimeout(context.Background(), 30*time.Second)
 
 	finish := func(status Status, content string, msgStatus session.MessageStatus, msgErr *session.MessageError, usage *sse.Usage) {
 		task.mu.Lock()
@@ -378,7 +425,19 @@ func (e *Executor) run(runCtx context.Context, task *Task, req Request, cancel c
 
 	var acc []byte
 	// 优先用 Loop（支持工具循环）；未配置时退化为单轮 Runner。
-	events := e.streamEvents(runCtx, runner, req, persistCtx)
+	// done 信号用于等待内部 goroutine（含工具落库）真正结束。
+	events, eventsDone := e.streamEvents(runCtx, runner, req, persistCtx)
+	defer func() {
+		// 等内部 goroutine 收尾再释放 persistCtx。
+		if eventsDone != nil {
+			select {
+			case <-eventsDone:
+			case <-time.After(10 * time.Second):
+				slog.Warn("等待工具落库超时", "session_id", req.SessionID)
+			}
+		}
+		persistCancel()
+	}()
 
 	for {
 		select {
@@ -442,6 +501,9 @@ func (e *Executor) run(runCtx context.Context, task *Task, req Request, cancel c
 					}
 				}
 				sseUsage := toSSEUsage(usage)
+
+				// 落库顺序：工具消息在事件到达时已经同步落库（见下方
+				// TypeToolCall / TypeToolResult 分支），这里只需落最终回答。
 				// 先落库再广播：保证收到 done 时历史已可查。
 				e.persistMessage(persistCtx, req.SessionID, req.MessageID, content,
 					session.StatusComplete, nil, sseUsage)
@@ -462,6 +524,16 @@ func (e *Executor) run(runCtx context.Context, task *Task, req Request, cancel c
 					continue
 				}
 				call := *ev.ToolCall
+
+				// 立即落库 assistant 的 tool_calls 消息。
+				//
+				// 为什么不等 Loop 收尾统一落库：前端收到 done 后可能立刻
+				// 刷新或断开，异步落库会被取消；而 tool 消息缺失会让模型
+				// 下次以为"没调过工具"，从 list_dir 重来（线上现象）。
+				// 在这里落库能与事件到达严格同步，且顺序天然正确
+				// （OpenAI 要求 tool 结果紧跟其 tool_calls）。
+				e.appendToolCallMessage(persistCtx, req.SessionID, call)
+
 				eventName := sse.EventToolCall
 				if call.RequiresApproval {
 					eventName = sse.EventToolApproval
@@ -479,6 +551,10 @@ func (e *Executor) run(runCtx context.Context, task *Task, req Request, cancel c
 					continue
 				}
 				r := *ev.ToolResult
+
+				// 立即落库工具结果（紧跟在对应 tool_calls 之后）。
+				e.appendToolResultMessage(persistCtx, req.SessionID, r)
+
 				task.Publish(sse.EventToolResult, func(seq uint64) any {
 					return sse.ToolResultData{
 						Seq: seq, SessionID: req.SessionID, MessageID: req.MessageID,
@@ -486,6 +562,45 @@ func (e *Executor) run(runCtx context.Context, task *Task, req Request, cancel c
 						IsError: r.IsError, Rejected: r.Rejected, DurationMs: r.DurationMs,
 					}
 				})
+
+			case agent.TypeAwaitingInput:
+				// 本轮挂起等待用户回答：不发 done、不落最终回答。
+				//
+				// 之前的文本增量（模型在提问前说的话）要保留下来，
+				// 否则用户看到一片空白，不知道模型为什么停下来。
+				if ev.Suspended == nil || len(ev.Suspended.Pendings) == 0 {
+					continue
+				}
+				cp := ev.Suspended
+
+				// 把已产出的文本落库成 assistant 消息（状态为 streaming），
+				// 让「模型说了什么 + 在等什么」一起呈现。
+				e.persistMessage(persistCtx, req.SessionID, req.MessageID, string(acc),
+					session.StatusStreaming, nil, nil)
+				e.markSessionAwaitingInput(persistCtx, req.SessionID)
+
+				task.mu.Lock()
+				task.status = StatusSucceeded
+				task.mu.Unlock()
+
+				// 一个问题一个事件：前端可以逐个渲染卡片，
+				// 也保持与旧客户端的兼容（旧代码只认第一个 call_id）。
+				//
+				// qid 必须带上：多个问题可能属于**同一个** call_id
+				// （ask_user 一次调用里的 questions 数组），
+				// 前端只有靠 qid 才能把答案对应回具体问题。
+				for _, p := range cp.Pendings {
+					pending := p
+					task.Publish(sse.EventAwaitingInput, func(seq uint64) any {
+						return sse.AwaitingInputData{
+							Seq: seq, SessionID: req.SessionID, MessageID: req.MessageID,
+							CallID: pending.CallID, QID: pending.QID,
+							Question: pending.Question, Options: pending.Options,
+							Multi: pending.Multi, StepIndex: cp.StepIndex,
+						}
+					})
+				}
+				return
 
 			case agent.TypeError:
 				if errors.Is(ev.Err, context.Canceled) {
@@ -518,21 +633,26 @@ func (e *Executor) run(runCtx context.Context, task *Task, req Request, cancel c
 	}
 }
 
-// streamEvents 返回执行事件流。
+// streamEvents 返回执行事件流与「内部 goroutine 已全部收尾」的信号。
 //
 // 有工具注册表时走 Loop（ReAct 多轮循环），否则退化为单轮 Runner。
 // 两条路径都产出统一的 agent.Event 序列，下游无感。
+//
+// done 通道的意义：工具调用落库发生在内部 goroutine 里，调用方必须
+// 等它关闭后再释放 persistCtx，否则写入会因 ctx 取消而静默失败。
 func (e *Executor) streamEvents(
 	runCtx context.Context,
 	runner agent.Runner,
 	req Request,
 	persistCtx context.Context,
-) <-chan agent.Event {
+) (<-chan agent.Event, <-chan struct{}) {
 	out := make(chan agent.Event, 16)
+	done := make(chan struct{})
 
 	if e.registry == nil || e.registry.Len() == 0 {
 		// 无工具：直接转发 Runner 事件。
 		go func() {
+			defer close(done)
 			defer close(out)
 			for ev := range runner.Run(runCtx, agent.Request{
 				History:      req.History,
@@ -545,19 +665,29 @@ func (e *Executor) streamEvents(
 				}
 			}
 		}()
-		return out
+		return out, done
 	}
 
 	go func() {
+		defer close(done)
 		defer close(out)
+
+		// 读一次快照：配置可能在 Start 之后被 SetXXX 改动。
+		e.mu.Lock()
+		checkpointer := e.checkpointer
+		e.mu.Unlock()
+
 		lp := loop.New(runner, loop.Config{
 			Registry:     e.registry,
 			SystemPrompt: e.systemPrompt,
 			MaxSteps:     e.maxSteps,
 			ToolTimeout:  e.toolTimeout,
 			Approver:     e.approver,
+			// 关键：把 sessionID 传给 loop，checkpoint 以它为键落库。
+			SessionID:    req.SessionID,
+			Checkpointer: checkpointer,
 		})
-		res, err := lp.Run(runCtx, req.History, out)
+		_, err := lp.Run(runCtx, req.History, out)
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			select {
 			case <-runCtx.Done():
@@ -565,80 +695,95 @@ func (e *Executor) streamEvents(
 			}
 			return
 		}
-		// 工具调用记录落库。
-		//
-		// 顺序极其重要：必须先落 assistant 的 tool_calls 消息，
-		// 再落对应的 tool 结果。否则 OpenAI 会以
-		// "Messages with role 'tool' must be a response to a preceding
-		// message with 'tool_calls'" 拒绝后续请求。
-		if res != nil && len(res.ToolResults) > 0 {
-			e.persistToolMessages(persistCtx, req.SessionID, res)
+		// 本轮因等待用户回答而挂起：发一个专门的事件，
+		// 让前端切到「等待输入」状态，而不是把空内容当完成或中断。
+		if cp := lp.Suspended(); cp != nil {
+			select {
+			case <-runCtx.Done():
+			case out <- agent.Event{Type: agent.TypeAwaitingInput, Suspended: cp}:
+			}
+			return
 		}
+		// 注意：工具消息的落库已在 TypeToolCall / TypeToolResult 事件
+		// 到达时同步完成，这里不再重复落库（重复会造成历史里出现
+		// 成对的重复 tool_calls，模型会看到"调用了两次"）。
 	}()
-	return out
+	return out, done
 }
 
-// persistToolMessages 把 assistant 的 tool_calls 与对应 tool 结果成对落库。
+// appendToolCallMessage 立即落库一条 assistant(tool_calls) 消息。
 //
-// 历史回放必须保持「tool_calls → tool 结果」的配对关系，
-// 因此这里按 assistant 消息的顺序，逐条落其发起的调用与结果。
-func (e *Executor) persistToolMessages(ctx context.Context, sessionID string, res *loop.Result) {
-	if e.store == nil || len(res.ToolResults) == 0 {
+// 每条 tool_call 落一条独立 assistant 消息，与随后的 tool 结果严格配对。
+func (e *Executor) appendToolCallMessage(ctx context.Context, sessionID string, call agent.ToolCall) {
+	if e.store == nil {
 		return
 	}
-
-	// 建立 callID → 结果 的索引，便于按 assistant 消息分组。
-	resultByCall := make(map[string]agent.ToolResult, len(res.ToolResults))
-	for _, r := range res.ToolResults {
-		resultByCall[r.CallID] = r
-	}
-
 	now := time.Now().UTC()
-	for _, asst := range res.AssistantMessages {
-		// 1) 先落 assistant（带 tool_calls），它是 tool 消息的前置。
-		out := &session.Message{
-			ID:        session.NewMessageID(),
-			SessionID: sessionID,
-			Role:      session.RoleAssistant,
-			Content:   asst.Content,
-			Status:    session.StatusComplete,
-			ToolCalls: asst.ToolCalls,
-			CreatedAt: now,
-			UpdatedAt: now,
-		}
-		if err := e.store.AppendMessage(ctx, out); err != nil {
-			slog.Warn("assistant 工具调用落库失败", "err", err, "session_id", sessionID)
-			// 落库失败时不能继续落 tool 消息，否则又会产生孤儿。
-			continue
-		}
-
-		// 2) 再落该 assistant 消息里每个调用对应的结果。
-		for _, tc := range asst.ToolCalls {
-			r, ok := resultByCall[tc.ID]
-			if !ok {
-				// 没有结果（例如执行被中断）：不要凭空造一条 tool 消息。
-				continue
-			}
-			status := session.StatusComplete
-			if r.IsError {
-				status = session.StatusError
-			}
-			toolMsg := &session.Message{
-				ID:         session.NewMessageID(),
-				SessionID:  sessionID,
-				Role:       session.RoleTool,
-				Content:    r.Output,
-				Status:     status,
-				ToolCallID: r.CallID,
-				CreatedAt:  now,
-				UpdatedAt:  now,
-			}
-			if err := e.store.AppendMessage(ctx, toolMsg); err != nil {
-				slog.Warn("工具结果落库失败", "err", err, "call_id", r.CallID)
-			}
-		}
+	m := &session.Message{
+		ID:        session.NewMessageID(),
+		SessionID: sessionID,
+		Role:      session.RoleAssistant,
+		Content:   "",
+		Status:    session.StatusComplete,
+		ToolCalls: []session.ToolCall{{
+			ID: call.ID, Name: call.Name, Args: call.Args,
+		}},
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := e.store.AppendMessage(ctx, m); err != nil {
+		slog.Warn("工具调用消息落库失败", "err", err,
+			"session_id", sessionID, "call_id", call.ID)
 	}
 }
+
+// appendToolResultMessage 立即落库对应工具结果（role=tool）。
+func (e *Executor) appendToolResultMessage(ctx context.Context, sessionID string, r agent.ToolResult) {
+	if e.store == nil {
+		return
+	}
+	status := session.StatusComplete
+	if r.IsError {
+		status = session.StatusError
+	}
+	now := time.Now().UTC()
+	m := &session.Message{
+		ID:         session.NewMessageID(),
+		SessionID:  sessionID,
+		Role:       session.RoleTool,
+		Content:    r.Output,
+		Status:     status,
+		ToolCallID: r.CallID,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}
+	if err := e.store.AppendMessage(ctx, m); err != nil {
+		slog.Warn("工具结果落库失败", "err", err,
+			"session_id", sessionID, "call_id", r.CallID)
+	}
+}
+
+// markSessionAwaitingInput 把会话标记为「等待用户输入」。
+//
+// 为什么需要独立的会话状态而不是复用 running/idle：
+//   - 复用 running：前端会一直显示「生成中」，用户不知道是在等自己；
+//   - 复用 idle：重启后 RecoverStaleRunning 会把它当僵尸清掉，
+//     「有会话在等你回答」这个信息就丢了。
+//
+// 因此加一个 suspended，让恢复逻辑能区分对待。
+func (e *Executor) markSessionAwaitingInput(ctx context.Context, sessionID string) {
+	if e.store == nil {
+		return
+	}
+	if _, err := e.store.Update(ctx, sessionID, func(sc *session.Session) error {
+		sc.Status = session.SessionSuspended
+		return nil
+	}); err != nil && !errors.Is(err, session.ErrNotFound) {
+		slog.Warn("标记会话为等待输入失败", "err", err, "session_id", sessionID)
+	}
+}
+
+// persistMessage 落库最终回答并复位会话状态。
 func (e *Executor) persistMessage(
 	ctx context.Context, sessionID, msgID, content string,
 	msgStatus session.MessageStatus, msgErr *session.MessageError, usage *sse.Usage,

@@ -23,7 +23,35 @@ const (
 	EventToolCall     = "tool.call"     // 模型请求调用工具
 	EventToolResult   = "tool.result"   // 工具执行完成
 	EventToolApproval = "tool.approval" // 需要人工审批
+
+	// EventAwaitingInput 本轮因等待用户回答而挂起（ask_user）。
+	//
+	// 单独一个事件而不是复用 message.done：前端据此把消息标成
+	// 「等待输入」并弹出问答卡片，而不是当成已完成的回答。
+	EventAwaitingInput = "awaiting.input"
 )
+
+// AwaitingInputData 等待用户回答的事件负载。
+type AwaitingInputData struct {
+	Seq       uint64 `json:"seq"`
+	SessionID string `json:"session_id"`
+	MessageID string `json:"message_id"`
+	// CallID 待回答的工具调用 ID，resume 时原样回传（幂等键）。
+	CallID string `json:"call_id"`
+	// QID 该问题在一次调用内的短标识。
+	//
+	// 一个 ask_user 调用可含多个问题（questions 数组），它们的 CallID
+	// 相同、QID 不同。前端用 qid 把答案对应回具体问题。
+	QID string `json:"qid,omitempty"`
+	// Question 要展示给用户的问题。
+	Question string `json:"question"`
+	// Options 可选项；为空表示自由输入。
+	Options []string `json:"options,omitempty"`
+	// Multi 是否允许多选。
+	Multi bool `json:"multi,omitempty"`
+	// StepIndex 停在循环的第几步（排查用）。
+	StepIndex int `json:"step_index"`
+}
 
 // ToolCallData 工具调用事件负载。
 type ToolCallData struct {

@@ -39,6 +39,8 @@ type Server struct {
 	rebuildRunner func(*modelconfig.Config) (agent.Runner, error)
 	// tools 工具注册表（nil 表示未启用）。
 	tools *tool.Registry
+	// checkpoints 断点存储（nil 表示不支持挂起等待回答）。
+	checkpoints session.CheckpointStore
 }
 
 // NewServer 组装 HTTP 层依赖。
@@ -76,6 +78,15 @@ func (s *Server) SetTools(registry *tool.Registry, systemPrompt string, maxSteps
 
 // Tools 返回当前工具注册表（可为 nil）。
 func (s *Server) Tools() *tool.Registry { return s.tools }
+
+// SetCheckpointer 注入断点存储，启用「等待用户回答」能力。
+//
+// 传 nil 表示禁用挂起：交互型工具（ask_user）会退化为返回一条
+// 「无法提问」的工具结果，而不是让整轮请求失败。
+func (s *Server) SetCheckpointer(cp session.CheckpointStore) {
+	s.checkpoints = cp
+	s.exec.SetCheckpointer(cp)
+}
 
 // handleListTools 列出可用工具（供前端展示与调试）。
 func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {

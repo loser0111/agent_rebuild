@@ -119,3 +119,63 @@ export function ToolCallList({ calls }: { calls: ToolCallView[] }) {
     </div>
   )
 }
+
+/** 把一组工具调用压缩成一句摘要，如「工具调用 3 次 · list_dir, search」。 */
+function summarizeCalls(calls: ToolCallView[]): string {
+  const names = Array.from(new Set(calls.map((c) => c.name).filter(Boolean)))
+  const head = names.slice(0, 3).join(', ')
+  const more = names.length > 3 ? ` 等 ${names.length} 个` : ''
+  return head ? `${head}${more}` : '工具调用'
+}
+
+/**
+ * 折叠式工具调用摘要。
+ *
+ * 默认收起成一行，挂在消息头部（Agent 标签右侧），避免大段工具输出
+ * 淹没真正的回答；需要时点开才展开完整卡片。
+ *
+ * 运行中的调用会自动展开：用户需要看见"正在做什么"，
+ * 收起反而像是卡住了。
+ */
+export function ToolCallSummary({ calls }: { calls: ToolCallView[] }) {
+  const running = calls.some((c) => c.status === 'running')
+  const anyError = calls.some((c) => c.status === 'error')
+  const [open, setOpen] = useState(false)
+
+  // 运行中强制展开（不写进 state，避免用户手动收起后又被覆盖）。
+  const expanded = open || running
+
+  if (calls.length === 0) return null
+
+  return (
+    <div className={`tool-summary${expanded ? ' is-open' : ''}`}>
+      <button
+        className={`tool-summary-btn${anyError ? ' has-error' : ''}${running ? ' is-running' : ''}`}
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title={expanded ? '收起工具调用详情' : '展开工具调用详情'}
+      >
+        {running && <span className="tool-spinner" aria-hidden="true" />}
+        {!running && (
+          <span
+            className={`tool-status-dot is-${anyError ? 'error' : 'success'}`}
+            aria-hidden="true"
+          />
+        )}
+        <span className="tool-summary-count">
+          {running ? '正在调用' : '工具调用'} {calls.length} 次
+        </span>
+        <span className="tool-summary-names">{summarizeCalls(calls)}</span>
+        <span className={`tool-caret${expanded ? ' is-open' : ''}`} aria-hidden="true">
+          ▾
+        </span>
+      </button>
+
+      {expanded && (
+        <div className="tool-summary-body">
+          <ToolCallList calls={calls} />
+        </div>
+      )}
+    </div>
+  )
+}

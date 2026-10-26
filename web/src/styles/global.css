@@ -670,6 +670,85 @@ kbd {
   gap: 7px;
   font-size: 12px;
   color: var(--text-muted);
+  /* 工具调用摘要可能与标签同行排不下，允许换行 */
+  flex-wrap: wrap;
+}
+
+/* ---- 工具调用折叠摘要 ---- */
+
+.tool-summary {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  min-width: 0;
+}
+
+/* 展开状态：占满整行（换行到 Agent 标签下方），
+   否则卡片会被挤在摘要胶囊的宽度里，长输出全被裁。 */
+.tool-summary.is-open {
+  flex: 1 0 100%;
+  width: 100%;
+}
+
+/* 摘要气泡：挂在 Agent 标签右侧，需要一眼看清"调了几次、调了什么"。
+   过小的字号配合胶囊圆角会显得灰暗难读，这里统一放大一档。 */
+.tool-summary-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 100%;
+  padding: 4px 12px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-soft);
+  background: var(--bg-active);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.tool-summary-btn:hover {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.tool-summary-btn.has-error {
+  border-color: rgba(229, 72, 77, 0.45);
+}
+
+.tool-summary-btn.is-running {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.tool-summary-count {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.tool-summary-names {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 320px;
+}
+
+.tool-summary-btn .tool-caret {
+  margin-left: 2px;
+  font-size: 10px;
+}
+
+/* 展开后的卡片列表：占满整行宽度，避免被摘要胶囊的宽度挤扁。 */
+.tool-summary-body {
+  margin-top: 8px;
+  width: 100%;
+  max-width: min(820px, 92vw);
 }
 
 .avatar {
@@ -712,9 +791,9 @@ kbd {
 .tool-card-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 9px;
   width: 100%;
-  padding: 8px 11px;
+  padding: 10px 13px;
   text-align: left;
   color: var(--text-soft);
   transition: background 0.12s ease;
@@ -727,8 +806,8 @@ kbd {
 /* 状态圆点 */
 .tool-status-dot {
   flex: none;
-  width: 6px;
-  height: 6px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
   background: var(--text-faint);
 }
@@ -764,7 +843,8 @@ kbd {
 
 .tool-name {
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: 13px;
+  font-weight: 500;
   color: var(--text);
 }
 
@@ -772,7 +852,7 @@ kbd {
   display: inline-flex;
   align-items: center;
   gap: 5px;
-  font-size: 11.5px;
+  font-size: 12.5px;
   color: var(--text-muted);
 }
 
@@ -957,7 +1037,8 @@ kbd {
 /* 状态标签 */
 .tag-running,
 .tag-error,
-.tag-warn {
+.tag-warn,
+.tag-awaiting {
   padding: 0 7px;
   font-size: 10.5px;
   line-height: 17px;
@@ -968,6 +1049,15 @@ kbd {
 .tag-running {
   color: var(--accent);
   background: var(--accent-soft);
+}
+
+/* 「等待回答」用更醒目的实心样式：它是需要用户行动的阻塞态，
+   与「生成中」这种纯被动等待区分开。 */
+.tag-awaiting {
+  color: var(--bg);
+  background: var(--warn);
+  border-color: var(--warn);
+  font-weight: 500;
 }
 
 .tag-error {
@@ -1282,6 +1372,189 @@ kbd {
   flex: 0 0 auto;
   padding: 10px 22px 6px;
   background: linear-gradient(to top, var(--bg) 72%, transparent);
+}
+
+/* ---- 问答卡片（ask_user）---- */
+
+.ask-card {
+  max-width: 860px;
+  margin: 0 auto 8px;
+  padding: 12px 14px 10px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, var(--accent-soft), var(--bg-input) 60%);
+  /* 用外发光强调「必须处理」，而不是靠动画吸引注意力 */
+  box-shadow: 0 0 0 1px var(--accent-soft), 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.ask-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.ask-badge {
+  padding: 1px 7px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 999px;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid rgba(16, 163, 127, 0.35);
+}
+
+.ask-hint {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
+.ask-question {
+  font-size: 13.5px;
+  line-height: 1.7;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-bottom: 8px;
+}
+
+/* 多问题时的单条容器：用左侧竖线分隔，避免几个问题糊成一片 */
+.ask-item {
+  position: relative;
+  padding-bottom: 4px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ask-item:last-of-type {
+  border-bottom: none;
+}
+
+.ask-index {
+  position: absolute;
+  top: 0;
+  left: -2px;
+  width: 16px;
+  text-align: center;
+  font-size: 10.5px;
+  line-height: 16px;
+  border-radius: 50%;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* 已答的问题：序号变成对勾，用户一眼看出进度 */
+.ask-index.is-done {
+  color: var(--bg);
+  background: var(--accent);
+}
+
+/* 带选项时也允许自由输入补充：模型给的两个选项经常都不完全合适 */
+.ask-option-input {
+  flex: 1 1 160px;
+  min-width: 120px;
+  padding: 6px 12px;
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+}
+
+.ask-option-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.ask-item .ask-index ~ .ask-question {
+  padding-left: 22px;
+}
+
+.ask-remaining {
+  margin-right: auto;
+  font-size: 11.5px;
+  color: var(--warn);
+}
+
+.ask-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.ask-option {
+  padding: 6px 14px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+}
+
+.ask-option:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.ask-option.is-selected {
+  color: var(--bg);
+  background: var(--accent);
+  border-color: var(--accent);
+  font-weight: 500;
+}
+
+.ask-option:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.ask-input {
+  width: 100%;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  resize: vertical;
+}
+
+.ask-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.ask-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.ask-submit {
+  padding: 6px 16px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--bg);
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  transition: opacity 0.12s ease;
+}
+
+.ask-submit:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.ask-submit:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .composer-box {

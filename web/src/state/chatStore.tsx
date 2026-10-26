@@ -10,7 +10,9 @@ import {
 } from 'react'
 import { api, ApiRequestError } from '../api/client'
 import { streamPost } from '../api/sse'
+import { rebuildToolCalls } from './toolRestore'
 import type {
+  AwaitingInputData,
   HealthResponse,
   Message,
   MessageDoneData,
@@ -18,6 +20,7 @@ import type {
   MessageErrorData,
   MessageInterruptedData,
   MessageStartData,
+  PendingQuestion,
   ResyncData,
   Session,
   SseEvent,
@@ -46,6 +49,24 @@ export interface ChatState {
   error: string | null
   reconnectHint: string | null
   lastEventId: number
+  /**
+   * 挂起中的提问（ask_user）。非空时输入框应切换成问答卡片，
+   * 用户回答后走 resume 继续生成。
+   *
+   * 用列表而不是单个：同一轮里模型可能一次问多个问题
+   * （「你到哪一步了？」「要不要我改代码？」）。早期实现只保留
+   * 第一个，后面的问题在界面上直接消失。
+   */
+  pendingQuestions: PendingQuestion[]
+  /**
+   * 用户正在填写的答案（call_id → 文本）。
+   *
+   * 为什么放在 store 而不是 AskUserCard 的局部 state：
+   * 同一份答案要有两个入口——卡片里的选项按钮/文本框，以及
+   * 底部主输入框。放在组件内部时 Composer 读不到，用户就没法
+   * 用最顺手的输入框答题（只能去卡片里的小输入区）。
+   */
+  draftAnswers: Record<string, string>
 }
 
 const initialState: ChatState = {
@@ -63,6 +84,8 @@ const initialState: ChatState = {
   error: null,
   reconnectHint: null,
   lastEventId: 0,
+  pendingQuestions: [],
+  draftAnswers: {},
 }
 
 type Action =
@@ -88,7 +111,12 @@ type Action =
   | { type: 'stream/end' }
   | { type: 'tools/call'; payload: ToolCallView }
   | { type: 'tools/result'; payload: { call_id: string; patch: Partial<ToolCallView> } }
+  | { type: 'tools/restore'; payload: Record<string, ToolCallView> }
   | { type: 'tools/reset' }
+  | { type: 'pending/set'; payload: PendingQuestion[] }
+  | { type: 'pending/append'; payload: PendingQuestion }
+  | { type: 'draft/set'; payload: { callId: string; value: string } }
+  | { type: 'draft/reset' }
   | { type: 'error/set'; payload: string | null }
   | { type: 'reconnect/hint'; payload: string | null }
 
@@ -133,6 +161,10 @@ function reducer(state: ChatState, action: Action): ChatState {
         currentId: action.payload,
         messages: [],
         toolCalls: {},
+        // 挂起状态属于「上一个会话」，切会话必须清掉，
+        // 否则会把 A 会话的问题显示在 B 会话的输入区。
+        pendingQuestions: [],
+        draftAnswers: {},
         error: null,
         reconnectHint: null,
         lastEventId: 0,
@@ -234,8 +266,31 @@ function reducer(state: ChatState, action: Action): ChatState {
       }
     }
 
+    case 'tools/restore':
+      return { ...state, toolCalls: action.payload }
+
     case 'tools/reset':
       return { ...state, toolCalls: {} }
+
+    case 'pending/set':
+      return { ...state, pendingQuestions: action.payload }
+
+    case 'pending/append': {
+      // 同 key 重复到达时替换而非追加，避免重连重放产生重复卡片。
+      // 用 key（call_id 或 call_id::qid）而不是 call_id：
+      // 一次调用里的多个问题共享 call_id，只有 key 能区分它们。
+      const rest = state.pendingQuestions.filter((q) => q.key !== action.payload.key)
+      return { ...state, pendingQuestions: [...rest, action.payload] }
+    }
+
+    case 'draft/set':
+      return {
+        ...state,
+        draftAnswers: { ...state.draftAnswers, [action.payload.callId]: action.payload.value },
+      }
+
+    case 'draft/reset':
+      return { ...state, draftAnswers: {} }
 
     case 'error/set':
       return {
@@ -266,12 +321,31 @@ interface ChatContextValue extends ChatState {
   sendMessage: (content: string) => Promise<void>
   stopGeneration: () => Promise<void>
   resync: () => Promise<void>
+  /** 回答挂起中的提问（ask_user）并继续生成；answers 以 call_id 为键。 */
+  resume: (answers: Record<string, string>) => Promise<void>
+  /** 更新某个问题的草稿答案（卡片与输入框共用） */
+  setDraftAnswer: (callId: string, value: string) => void
+  /** 清空所有草稿 */
+  resetDrafts: () => void
+  /** 重新查询是否有挂起中的提问 */
+  refreshPending: () => Promise<void>
   dismissError: () => void
   /** 切换当前会话使用的模型配置（立即持久化到服务端） */
   setActiveModel: (modelConfigId: string) => Promise<void>
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null)
+
+/**
+ * 把前端持有的问题列表转成 reducer 状态。
+ *
+ * 单独抽出来是因为「同一轮多个问题」需要稳定的顺序：
+ * 后端按 Pendings 顺序下发，展示顺序应与模型提问顺序一致，
+ * 否则用户会觉得第二个问题「跳」到了前面。
+ */
+function toPendingState(list: PendingQuestion[]): PendingQuestion[] {
+  return list.filter((q) => q.callId)
+}
 
 /** 乐观渲染用的本地消息，id 带 tmp_ 前缀，收到 message.start 后改为服务端 id。 */
 function tempMessage(role: Message['role'], sessionId: string, content: string): Message {
@@ -300,27 +374,100 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const streamingRef = useRef<string | null>(null)
   streamingRef.current = state.streamingMessageId
 
+  /**
+   * 从后端取「挂起中的提问」列表。
+   *
+   * 为什么不能只靠事件：awaiting.input 事件只存在于当次事件流里，
+   * 页面刷新、切走再切回、甚至进程重启后都拿不到。而用户最需要的
+   * 恰恰是「关掉窗口明天再回答」这种场景，所以必须能主动查一次。
+   *
+   * 返回数组而不是单个：同一轮里模型可能一次问多个问题。
+   */
+  const fetchPending = useCallback(async (id: string): Promise<PendingQuestion[]> => {
+    try {
+      const cp = await api.getCheckpoint(id)
+      if (!cp.suspended) return []
+      // 新接口返回 questions 列表；旧后端只给单个 call_id，做一次兼容。
+      if (cp.questions?.length) {
+        return cp.questions.map((q) => ({
+          key: q.key || (q.qid ? `${q.call_id}::${q.qid}` : q.call_id),
+          callId: q.call_id,
+          qid: q.qid ?? '',
+          messageId: '',
+          question: q.question ?? '',
+          options: q.options ?? [],
+          multi: q.multi ?? false,
+        }))
+      }
+      if (!cp.call_id) return []
+      return [
+        {
+          key: cp.call_id,
+          callId: cp.call_id,
+          qid: '',
+          messageId: '',
+          question: cp.question ?? '',
+          options: cp.options ?? [],
+          multi: false,
+        },
+      ]
+    } catch {
+      // 查不到就当作没有挂起：不能因为恢复失败把正常会话也卡住。
+      return []
+    }
+  }, [])
+
+  /** 重新同步挂起态（供「重新同步」等入口调用）。 */
+  const restorePending = useCallback(
+    async (id: string) => {
+      const list = await fetchPending(id)
+      dispatch({ type: 'pending/set', payload: toPendingState(list) })
+    },
+    [fetchPending],
+  )
+
   /** 拉取会话详情（同时是断线后的兜底补齐路径）。 */
   const loadDetail = useCallback(async (id: string) => {
     dispatch({ type: 'current/set', payload: id })
     dispatch({ type: 'messages/loading' })
     try {
       const detail = await api.getSession(id)
+
+      // 先查一次挂起状态：还原工具卡片时需要用它区分
+      // 「正在等回答的调用」与「真的丢了结果的调用」。
+      // 挂起时 assistant(tool_calls) 已落库但 tool 结果还没有，
+      // 若不区分就会把待回答的 ask_user 显示成「失败」。
+      let pending: PendingQuestion[] = []
+      if (detail.session.status === 'suspended') {
+        pending = await fetchPending(id)
+      }
+      const pendingIds = new Set(pending.map((p) => p.callId))
+
+      // 历史里的工具调用要先还原成卡片，否则会以纯文本形式铺在对话里。
+      const restored = rebuildToolCalls(detail.messages, pendingIds)
+      dispatch({ type: 'tools/restore', payload: restored })
       dispatch({
         type: 'messages/loaded',
         payload: { messages: detail.messages, lastEventId: detail.last_event_id },
       })
+      dispatch({
+        type: 'pending/set',
+        payload: toPendingState(pending),
+      })
       if (detail.session.status === 'running') {
+        // 后端标记为 running，但本端没有正在进行的流：
+        // 通常是上次进程异常退出留下的残留状态（后端重启后会自动复位，
+        // 若仍出现说明是新一轮异常）。提示用户可尝试重置。
         dispatch({
           type: 'reconnect/hint',
-          payload: '服务端显示该会话仍在生成中，可稍后点「重新同步」拉取最新内容',
+          payload: '该会话被标记为「生成中」，但当前没有正在进行的回答。可尝试重置状态',
         })
       }
     } catch (err) {
       dispatch({ type: 'messages/loaded', payload: { messages: [], lastEventId: 0 } })
       dispatch({ type: 'error/set', payload: describeError(err) })
     }
-  }, [])
+  }, [fetchPending])
 
   /** 初始化：健康检查 + 会话列表（自动选中最近一个）。 */
   const bootstrap = useCallback(async () => {
@@ -473,6 +620,29 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         dispatch({ type: 'reconnect/hint', payload: null })
         break
       }
+      case 'awaiting.input': {
+        // 模型提问后挂起：本轮没有最终回答，输入区改为问答卡片。
+        //
+        // 同一轮可能有多个问题，后端逐个发事件。这里**追加**到列表，
+        // 而不是覆盖——覆盖会让前几个问题一闪而过，用户只看到最后一个。
+        const d = ev.data as AwaitingInputData
+        settledRef.current = true
+        dispatch({ type: 'pending/append', payload: {
+          key: d.qid ? `${d.call_id}::${d.qid}` : d.call_id,
+          callId: d.call_id,
+          qid: d.qid ?? '',
+          messageId: d.message_id,
+          question: d.question,
+          options: d.options ?? [],
+          multi: d.multi ?? false,
+        } })
+        // 占位消息不该继续显示「生成中」的打字动画。
+        dispatch({
+          type: 'messages/patch',
+          payload: { id: d.message_id, patch: { status: 'streaming' } },
+        })
+        break
+      }
       case 'error': {
         settledRef.current = true
         const payload = ev.data as { error?: { message?: string } }
@@ -502,8 +672,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const tempAssistantId = assistantMsg.id
 
       settledRef.current = false
-      // 新的一轮对话：清掉上一轮的工具调用记录，避免串台。
-      dispatch({ type: 'tools/reset' })
+      // 注意：这里**不能**清空 toolCalls。
+      // 卡片是按 message_id 归属到具体某条 assistant 消息的，天然隔离；
+      // 早期版本在每次发送前 dispatch('tools/reset')，会把整个会话里
+      // 前几轮的工具气泡一起抹掉（第二问开始，第一问的调用就消失了）。
       dispatch({ type: 'messages/append', payload: [userMsg, assistantMsg] })
       dispatch({ type: 'stream/begin', payload: { messageId: tempAssistantId } })
 
@@ -583,16 +755,168 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     [handleEvent, state.sessions],
   )
 
+  /**
+   * 回答挂起中的提问，并继续生成。
+   *
+   * 与 sendMessage 的关键差异：
+   *   - 不再插入 user 消息。用户的回答会由后端落成一条 tool 消息，
+   *     界面上应以「工具结果」而非「用户新提问」呈现，
+   *     否则对话里会凭空多出一句用户没打过的话。
+   *   - 只补一条 assistant 占位消息承载后续增量。
+   *   - 请求走 /resume，带上 call_id 做幂等校验。
+   */
+  const resume = useCallback(
+    async (answers: Record<string, string>) => {
+      const sessionId = currentIdRef.current
+      const pending = state.pendingQuestions
+      if (!sessionId) {
+        dispatch({ type: 'error/set', payload: '请先选择会话' })
+        return
+      }
+      if (pending.length === 0) {
+        dispatch({ type: 'error/set', payload: '当前没有待回答的问题' })
+        return
+      }
+      if (Object.keys(answers).length === 0) return
+      if (streamingRef.current) return
+
+      // 先清掉挂起态：避免用户连点两次重复提交。
+      // 若请求失败，下面会重新查一次 checkpoint 把它恢复回来。
+      dispatch({ type: 'pending/set', payload: [] })
+      dispatch({ type: 'draft/reset' })
+
+      // 立刻把被回答的卡片从「调用中」翻成「完成」。
+      //
+      // 为什么必须在这一刻做，而不是等后端事件：
+      // resume 的响应流里只有后续生成的增量，**不会有** tool.result
+      // （tool 消息是后端直接写库的，不发事件）。若不在这里主动收尾，
+      // 卡片会永远停在「调用中」——用户明明答过了，界面却显示还在等。
+      //
+      // 注意要用 callId 而不是提交键：卡片是按 call_id 索引的，
+      // 一次调用内的多个问题共享同一条卡片。
+      for (const q of pending) {
+        const answer = answers[q.key]
+        if (answer === undefined) continue
+        dispatch({
+          type: 'tools/result',
+          payload: {
+            call_id: q.callId,
+            patch: { output: answer, status: 'success' },
+          },
+        })
+      }
+
+      const assistantMsg = tempMessage('assistant', sessionId, '')
+      const tempAssistantId = assistantMsg.id
+      settledRef.current = false
+      dispatch({ type: 'messages/append', payload: [assistantMsg] })
+      dispatch({ type: 'stream/begin', payload: { messageId: tempAssistantId } })
+
+      const controller = new AbortController()
+      abortRef.current = controller
+      let realAssistantId: string | null = null
+
+      let failed: string | null = null
+      await streamPost(
+        `/api/sessions/${sessionId}/resume`,
+        { answers },
+        {
+          onEvent: (ev) => {
+            if (ev.event === 'message.start') {
+              const d = ev.data as MessageStartData
+              realAssistantId = d.message_id
+              if (ev.id !== null) dispatch({ type: 'stream/event', payload: ev.id })
+              dispatch({
+                type: 'messages/rename',
+                payload: { from: tempAssistantId, to: d.message_id, patch: { status: 'streaming' } },
+              })
+              dispatch({ type: 'stream/phase', payload: 'streaming' })
+              return
+            }
+            handleEvent(ev)
+          },
+          onError: (err) => {
+            failed = err.message
+            dispatch({ type: 'error/set', payload: err.message })
+          },
+        },
+        { signal: controller.signal },
+      )
+
+      abortRef.current = null
+
+      if (failed) {
+        // 提交失败：把消息标为错误，并重新同步挂起态，
+        // 让用户能改一下答案再试，而不是卡片凭空消失。
+        const leftoverId = realAssistantId ?? tempAssistantId
+        dispatch({
+          type: 'messages/patch',
+          payload: { id: leftoverId, patch: { status: 'error' } },
+        })
+        // 回滚刚才的乐观更新：这些调用其实没被回答，
+        // 必须退回 running，否则卡片会显示「已完成」但问题还在。
+        for (const callId of Object.keys(answers)) {
+          dispatch({
+            type: 'tools/result',
+            payload: { call_id: callId, patch: { status: 'running' } },
+          })
+        }
+        dispatch({ type: 'stream/end' })
+        await restorePending(sessionId)
+        return
+      }
+
+      if (!settledRef.current && !controller.signal.aborted) {
+        dispatch({
+          type: 'reconnect/hint',
+          payload: '连接中断，回答可能不完整。点「重新同步」拉取服务端最新状态',
+        })
+      } else {
+        dispatch({ type: 'reconnect/hint', payload: null })
+      }
+
+      // 兜底收尾：与 sendMessage 一致，避免停在「生成中」。
+      const leftoverId = realAssistantId ?? tempAssistantId
+      const leftover = messagesRef.current.find((m) => m.id === leftoverId)
+      if (leftover && (leftover.status === 'pending' || leftover.status === 'streaming')) {
+        // 若这一轮又被挂起（模型追问），handleEvent 已把 pendingQuestion 设好，
+        // 这里只补状态，不能覆盖成 interrupted 让人误以为出错。
+        dispatch({
+          type: 'messages/patch',
+          payload: {
+            id: leftoverId,
+            patch: { status: controller.signal.aborted ? 'interrupted' : 'complete' },
+          },
+        })
+      }
+      dispatch({ type: 'stream/end' })
+
+      try {
+        const { sessions } = await api.listSessions()
+        dispatch({ type: 'sessions/loaded', payload: sessions })
+      } catch {
+        /* 列表刷新失败不影响主流程 */
+      }
+    },
+    [handleEvent, restorePending, state.pendingQuestions],
+  )
+
   const stopGeneration = useCallback(async () => {
     const sessionId = currentIdRef.current
     abortRef.current?.abort()
     if (!sessionId) return
     try {
-      await api.cancel(sessionId)
+      const res = await api.cancel(sessionId)
+      // 后端在"无任务但状态卡住"时会复位 running，此时重新拉一次详情
+      // 让提示消失、输入框恢复可用。
+      if (!res.canceled) {
+        dispatch({ type: 'reconnect/hint', payload: null })
+        await loadDetail(sessionId)
+      }
     } catch {
       /* 客户端已 abort，服务端取消失败不阻塞 UI */
     }
-  }, [])
+  }, [loadDetail])
 
   const resync = useCallback(async () => {
     dispatch({ type: 'reconnect/hint', payload: null })
@@ -605,6 +929,21 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   }, [bootstrap, loadDetail])
 
   const dismissError = useCallback(() => dispatch({ type: 'error/set', payload: null }), [])
+
+  /** 主动刷新挂起态（供「重新同步」等入口调用）。 */
+  const refreshPending = useCallback(async () => {
+    const id = currentIdRef.current
+    if (!id) return
+    await restorePending(id)
+  }, [restorePending])
+
+  /** 更新草稿答案。 */
+  const setDraftAnswer = useCallback((callId: string, value: string) => {
+    dispatch({ type: 'draft/set', payload: { callId, value } })
+  }, [])
+
+  /** 清空草稿。 */
+  const resetDrafts = useCallback(() => dispatch({ type: 'draft/reset' }), [])
 
   /** 当前会话已持久化的模型选择；会话没选过则为空串。 */
   const activeModelConfigId = useMemo(() => {
@@ -655,6 +994,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       sendMessage,
       stopGeneration,
       resync,
+      resume,
+      setDraftAnswer,
+      resetDrafts,
+      refreshPending,
       dismissError,
       setActiveModel,
     }),
@@ -667,6 +1010,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       sendMessage,
       stopGeneration,
       resync,
+      resume,
+      setDraftAnswer,
+      resetDrafts,
+      refreshPending,
       dismissError,
       setActiveModel,
     ],

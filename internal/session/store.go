@@ -17,6 +17,16 @@ var (
 	ErrInvalidCursor = errors.New("session: invalid cursor")
 	// ErrInvalidArgument 入参不满足领域约束（空 ID、非法角色等）。
 	ErrInvalidArgument = errors.New("session: invalid argument")
+
+	// ErrCheckpointInvalid checkpoint 结构不合法（状态缺失、挂起却无 Pending 等）。
+	ErrCheckpointInvalid = errors.New("session: invalid checkpoint")
+	// ErrCheckpointNoSession checkpoint 缺少 session_id。
+	//
+	// 单独一个错误：这是最容易犯的错（调用方忘了传会话 ID），
+	// 而与「结构非法」混在一起时很难定位。
+	ErrCheckpointNoSession = errors.New("session: checkpoint without session_id")
+	// ErrCheckpointNotFound 会话没有 checkpoint（通常是已经完成或被清理）。
+	ErrCheckpointNotFound = errors.New("session: checkpoint not found")
 )
 
 // ListOptions 列表查询参数。
@@ -54,6 +64,13 @@ type Store interface {
 	UpdateMessage(ctx context.Context, sessionID, msgID string, fn func(*Message) error) error
 	// Messages 返回会话的全部消息（时间正序副本）。
 	Messages(ctx context.Context, sessionID string) ([]Message, error)
+	// RecoverStaleRunning 把卡在 running 的会话复位为 idle，返回处理条数。
+	//
+	// 为什么要单独一个方法：running 状态只应存在于「进程内有任务在跑」期间。
+	// 进程崩溃 / 被强杀 / 容器重启后，数据库里会留下永久的 running，
+	// 前端据此提示「仍在生成中」，用户再怎么刷新都等不到结果。
+	// 启动时调用一次即可自愈。
+	RecoverStaleRunning(ctx context.Context) (int, error)
 }
 
 // Snapshot 是会话数据的全量可序列化快照。
@@ -75,6 +92,29 @@ const SnapshotVersion = 1
 type Snapshotter interface {
 	Snapshot(ctx context.Context) (*Snapshot, error)
 	Restore(ctx context.Context, snap *Snapshot) error
+}
+
+// CheckpointStore 是断点持久化的可插拔边界。
+//
+// 为什么独立于 Store 而不是加进 Store 接口：
+//   - checkpoint 只有 SQLite 驱动需要（内存驱动的进程重启即丢，无断点可言）；
+//     合进 Store 会强迫所有实现（含测试假实现）都补 4 个方法。
+//   - 语义上也不同：Store 管「会话与消息的事实」，CheckpointStore 管
+//     「执行进度」。混在一起会让 Store 越来越臃肿。
+//
+// 实现约定与 Store 一致：并发安全、深拷贝、原子读改写、不吞 ctx。
+type CheckpointStore interface {
+	// SaveCheckpoint 写入或覆盖会话的 checkpoint（一个会话只有一条）。
+	//
+	// 覆盖语义（而非报冲突）是刻意的：新一轮执行会正常覆盖上一轮
+	// 已完成的断点，否则每轮都要先显式删除。
+	SaveCheckpoint(ctx context.Context, cp *Checkpoint) error
+	// LoadCheckpoint 读取会话当前的 checkpoint。
+	// 不存在时返回 ErrCheckpointNotFound。
+	LoadCheckpoint(ctx context.Context, sessionID string) (*Checkpoint, error)
+	// DeleteCheckpoint 删除会话的 checkpoint（执行正常结束后清理）。
+	// 不存在时返回 nil（幂等），便于在 defer 里无脑调用。
+	DeleteCheckpoint(ctx context.Context, sessionID string) error
 }
 
 // normalizeListOptions 归一化分页参数，避免各实现重复写边界判断。

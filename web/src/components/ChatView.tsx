@@ -4,7 +4,8 @@ import { MessageItem } from './MessageItem'
 
 /** 主对话区：消息流 + 自动滚动 + 空态。 */
 export function ChatView() {
-  const { messages, currentId, detailLoading, reconnectHint, resync, isStreaming } = useChat()
+  const { messages, currentId, detailLoading, reconnectHint, resync, isStreaming, stopGeneration, toolCalls } =
+    useChat()
   const scrollRef = useRef<HTMLDivElement>(null)
   const [stuckToBottom, setStuckToBottom] = useState(true)
 
@@ -52,6 +53,16 @@ export function ChatView() {
             <button className="banner-btn" type="button" onClick={() => void resync()}>
               重新同步
             </button>
+            {currentId && (
+              <button
+                className="banner-btn"
+                type="button"
+                title="若会话卡在「生成中」，点此复位状态"
+                onClick={() => void stopGeneration()}
+              >
+                重置状态
+              </button>
+            )}
           </div>
         )}
 
@@ -66,9 +77,21 @@ export function ChatView() {
           </div>
         )}
 
-        {messages.map((m) => (
-          <MessageItem key={m.id} message={m} />
-        ))}
+        {messages.map((m) => {
+          // tool 结果已展示在所属的卡片里，不再单独渲染成一条消息，
+          // 否则内容会重复出现一遍。
+          if (m.role === 'tool') return null
+
+          // 「只带 tool_calls、content 为空」的 assistant 消息：
+          // 如果卡片挂在它身上（工具调用后没有最终回答）就必须渲染，
+          // 否则卡片会整个消失；挂在后续回答上时才跳过。
+          if (m.role === 'assistant' && !m.content && m.tool_calls?.length) {
+            const hosted = Object.values(toolCalls).some((c) => c.message_id === m.id)
+            if (!hosted) return null
+          }
+
+          return <MessageItem key={m.id} message={m} />
+        })}
 
         {isStreaming && <div className="chat-tail-spacer" />}
       </div>

@@ -425,6 +425,15 @@ func (a *AnthropicRunner) toMessages(history []session.Message) []anthropicMessa
 			}
 		}
 	}
+	// 第二遍：收集已有结果应答的 tool_use id。
+	// 未应答的 tool_use 同样非法（Anthropic 要求每个 tool_use 都有 tool_result），
+	// ask_user 挂起后就会留下这种，必须在发送前剔除。
+	answered := make(map[string]bool)
+	for _, m := range history {
+		if m.Role == session.RoleTool && m.ToolCallID != "" {
+			answered[m.ToolCallID] = true
+		}
+	}
 
 	out := make([]anthropicMessage, 0, len(history))
 	for _, m := range history {
@@ -468,6 +477,10 @@ func (a *AnthropicRunner) toMessages(history []session.Message) []anthropicMessa
 				blocks = append(blocks, anthropicContentBlock{Type: "text", Text: m.Content})
 			}
 			for _, tc := range m.ToolCalls {
+				// 只回传已有 tool_result 的调用，否则 Anthropic 会拒绝整个请求。
+				if tc.ID != "" && !answered[tc.ID] {
+					continue
+				}
 				input := json.RawMessage(tc.Args)
 				if len(input) == 0 || !json.Valid(input) {
 					input = json.RawMessage("{}")
@@ -478,6 +491,10 @@ func (a *AnthropicRunner) toMessages(history []session.Message) []anthropicMessa
 					Name:  tc.Name,
 					Input: input,
 				})
+			}
+			// 剔除后若只剩空块，这条消息没有意义，跳过（否则会发出空 content）。
+			if len(blocks) == 0 {
+				continue
 			}
 			out = append(out, anthropicMessage{Role: "assistant", Content: blocks})
 

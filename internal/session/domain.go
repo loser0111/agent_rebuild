@@ -136,7 +136,7 @@ func (s *Session) Validate() error {
 		return fmt.Errorf("%w: 会话 ID 不能为空", ErrInvalidArgument)
 	}
 	switch s.Status {
-	case SessionIdle, SessionRunning, SessionError:
+	case SessionIdle, SessionRunning, SessionError, SessionSuspended:
 	default:
 		return fmt.Errorf("%w: 未知会话状态 %q", ErrInvalidArgument, s.Status)
 	}

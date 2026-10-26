@@ -61,7 +61,7 @@ func run() error {
 		}
 	}
 
-	store, runner, models, closer, err := buildDataLayer(cfg)
+	store, checkpoints, runner, models, closer, err := buildDataLayer(cfg)
 	if err != nil {
 		return err
 	}
@@ -74,6 +74,17 @@ func run() error {
 			}
 		}
 	}()
+
+	// 清理上次进程遗留的 running 状态。
+	//
+	// running 只应存在于「本进程内有任务在跑」期间。进程被强杀或崩溃后
+	// 数据库会残留该状态，前端据此提示「仍在生成中」，用户刷新也等不到结果。
+	// 启动时复位一次即可自愈。
+	if n, recErr := store.RecoverStaleRunning(context.Background()); recErr != nil {
+		slog.Warn("复位遗留 running 会话失败", "err", recErr)
+	} else if n > 0 {
+		slog.Info("已复位上次遗留的生成中会话", "count", n)
+	}
 	locks := agent.NewLocks()
 
 	srv := api.NewServer(cfg, store, runner, locks)
@@ -84,6 +95,8 @@ func run() error {
 		EnableCommand: cfg.EnableCommandTool,
 	})
 	srv.SetTools(registry, cfg.SystemPrompt, cfg.MaxToolSteps, cfg.ToolTimeout)
+	// 断点存储：让 ask_user 能挂起等待回答（nil 表示不支持，自动降级）。
+	srv.SetCheckpointer(checkpoints)
 	// 注入模型配置存储 + Runner 重建器（支持运行时多模型切换）。
 	if models != nil {
 		srv.SetModelConfigStore(models, func(mc *modelconfig.Config) (agent.Runner, error) {
@@ -169,26 +182,28 @@ func run() error {
 //
 // 返回值 closer 用于在进程退出时释放资源（关闭数据库）。
 // 忘记调用它会丢数据：SQLite 的 WAL 需要 checkpoint 才能合并到主库。
-func buildDataLayer(cfg *config.Config) (session.Store, agent.Runner, modelconfig.Store, func() error, error) {
+func buildDataLayer(cfg *config.Config) (session.Store, session.CheckpointStore, agent.Runner, modelconfig.Store, func() error, error) {
 	switch cfg.StoreDriver {
 	case "memory", "":
 		// 内存模式：不支持持久化模型配置，退化为环境变量配置。
 		runner, err := buildRunnerFromConfig(cfg)
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, err
 		}
 		slog.Warn("使用内存存储：重启后会话与模型配置都会丢失")
-		return session.NewMemoryStore(cfg.MaxMessagesPerSession), runner, nil, nil, nil
+		// 内存模式没有 checkpoint：进程重启即丢，断点无从恢复，
+		// 返回 nil 让 ask_user 走「无法提问」的降级分支。
+		return session.NewMemoryStore(cfg.MaxMessagesPerSession), nil, runner, nil, nil, nil
 
 	case "sqlite":
 		dataDir, err := config.ResolveDataDir(cfg.DataDir)
 		if err != nil {
-			return nil, nil, nil, nil, fmt.Errorf("解析数据目录失败: %w", err)
+			return nil, nil, nil, nil, nil, fmt.Errorf("解析数据目录失败: %w", err)
 		}
 		dbPath := config.DBPath(dataDir)
 		db, err := sqlite.Open(dbPath)
 		if err != nil {
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, err
 		}
 		slog.Info("SQLite 已就绪", "path", dbPath, "data_dir", dataDir)
 
@@ -199,12 +214,14 @@ func buildDataLayer(cfg *config.Config) (session.Store, agent.Runner, modelconfi
 		runner, err := resolveRunner(cfg, models)
 		if err != nil {
 			_ = db.Close()
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, err
 		}
-		return sqlite.NewSessionStore(db, cfg.MaxMessagesPerSession), runner, models, db.Close, nil
+		return sqlite.NewSessionStore(db, cfg.MaxMessagesPerSession),
+			sqlite.NewCheckpointStore(db),
+			runner, models, db.Close, nil
 
 	default:
-		return nil, nil, nil, nil, fmt.Errorf(
+		return nil, nil, nil, nil, nil, fmt.Errorf(
 			"不支持的 STORE_DRIVER=%q（可选 memory / sqlite）", cfg.StoreDriver)
 	}
 }

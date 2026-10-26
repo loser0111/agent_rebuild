@@ -62,6 +62,13 @@ type Spec struct {
 	Parameters json.RawMessage `json:"parameters"`
 	// Risk 危险等级。
 	Risk Risk `json:"-"`
+	// Interactive 表示「交互型工具」：执行前必须拿到用户答复。
+	//
+	// 这与 Risk 是正交的两个维度，不能合并：
+	//   - ask_user 无副作用（RiskSafe），但要等人回答；
+	//   - run_command 有副作用（RiskDangerous），但不需要人回答就能跑。
+	// 若用 Risk 表达交互，会得出「安全工具无需审批 → 直接执行」的错误结论。
+	Interactive bool `json:"-"`
 }
 
 // Result 是工具执行结果。

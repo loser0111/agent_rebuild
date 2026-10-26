@@ -441,6 +441,32 @@ func (s *SessionStore) Messages(ctx context.Context, sessionID string) ([]sessio
 	return out, nil
 }
 
+// RecoverStaleRunning 把卡在 running 的会话复位为 idle。
+//
+// 场景：进程被强杀 / 崩溃 / 容器重启后，数据库里会残留 running 状态。
+// 前端据此显示「仍在生成中」，而实际没有任何任务在跑，
+// 用户重新打开会话只会看到一条永远不消失的提示。
+//
+// 在启动装配完成后调用一次即可自愈。
+func (s *SessionStore) RecoverStaleRunning(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	res, err := s.db.SQL().ExecContext(ctx, `
+		UPDATE sessions SET status = ?, updated_at = ?
+		WHERE status = ?`,
+		string(session.SessionIdle), toMillis(s.now()), string(session.SessionRunning),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: 复位 running 会话失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, nil // 计数不可得不算失败
+	}
+	return int(n), nil
+}
+
 // ---- 内部辅助 ----
 
 type scanner interface {
@@ -496,6 +522,15 @@ func scanMessage(sc scanner) (*session.Message, error) {
 		var e session.MessageError
 		if err := json.Unmarshal([]byte(errorJSON), &e); err == nil {
 			msg.Error = &e
+		}
+	}
+	// tool_calls 必须还原，否则历史里 assistant 消息看起来像"普通文本消息"，
+	// 配对的 tool 结果会变成孤儿被 toMessages 丢弃，
+	// 模型因此不知道工具已经调用过，每次对话都重复调用同一个工具。
+	if toolCalls != "" {
+		var tcs []session.ToolCall
+		if err := json.Unmarshal([]byte(toolCalls), &tcs); err == nil {
+			msg.ToolCalls = tcs
 		}
 	}
 	return &msg, nil

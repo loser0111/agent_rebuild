@@ -1,6 +1,6 @@
 /* 与后端 JSON 对齐的类型定义（见 docs/02-api-and-sse.md §0.2） */
 
-export type Role = 'user' | 'assistant' | 'system'
+export type Role = 'user' | 'assistant' | 'system' | 'tool'
 
 export type MessageStatus =
   | 'pending'
@@ -9,7 +9,7 @@ export type MessageStatus =
   | 'interrupted'
   | 'error'
 
-export type SessionStatus = 'idle' | 'running' | 'error'
+export type SessionStatus = 'idle' | 'running' | 'error' | 'suspended'
 
 export interface Usage {
   prompt_tokens: number
@@ -83,6 +83,14 @@ export interface TestModelConfigResponse {
   latency_ms?: number
 }
 
+/** 后端返回的工具调用记录（落库形态）。 */
+export interface StoredToolCall {
+  id: string
+  name: string
+  /** 参数 JSON 原样字符串 */
+  args: string
+}
+
 export interface Message {
   id: string
   session_id: string
@@ -93,6 +101,10 @@ export interface Message {
   updated_at: string
   usage?: Usage | null
   error?: MessageError | null
+  /** assistant 发起的工具调用（历史回放用） */
+  tool_calls?: StoredToolCall[] | null
+  /** tool 消息关联的调用 ID（历史回放用） */
+  tool_call_id?: string | null
 }
 
 export interface ApiError {
@@ -227,6 +239,59 @@ export interface ResyncData {
   session_id: string
   last_event_id: number
   messages: Message[]
+}
+
+/* ---- 等待用户回答（ask_user）---- */
+
+/** awaiting.input：模型提问后挂起，等待用户答复。 */
+export interface AwaitingInputData {
+  seq: number
+  session_id: string
+  message_id: string
+  /** 待回答的调用 ID（同一调用内多个问题时相同） */
+  call_id: string
+  /** 该问题在调用内的短标识（多问题时用于区分） */
+  qid?: string
+  question: string
+  options?: string[]
+  /** 是否允许多选 */
+  multi?: boolean
+  step_index: number
+}
+
+/** GET /sessions/{id}/checkpoint 的响应。 */
+export interface CheckpointResponse {
+  suspended: boolean
+  state?: string
+  /** 本轮所有待回答项（新格式）。 */
+  questions?: Array<{
+    call_id: string
+    qid?: string
+    /** 提交时使用的键：call_id 或 call_id::qid */
+    key?: string
+    question: string
+    options?: string[]
+    multi?: boolean
+  }>
+  /** 首个问题的扁平字段（兼容旧前端）。 */
+  call_id?: string
+  question?: string
+  options?: string[]
+  step_index?: number
+  updated_at?: string
+}
+
+/** 前端持有的「待回答提问」视图模型。 */
+export interface PendingQuestion {
+  /** 提交时使用的键：call_id 或 call_id::qid */
+  key: string
+  callId: string
+  qid: string
+  messageId: string
+  question: string
+  options: string[]
+  /** 是否允许多选 */
+  multi: boolean
 }
 
 export interface SseEvent {

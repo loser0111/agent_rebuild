@@ -372,8 +372,8 @@ func TestListToolsEndpoint(t *testing.T) {
 	}
 	env.getJSON(t, "/api/tools", http.StatusOK, &body)
 
-	if body.Count != 5 {
-		t.Fatalf("工具数 = %d，期望 5", body.Count)
+	if body.Count != 6 {
+		t.Fatalf("工具数 = %d，期望 6", body.Count)
 	}
 	names := make(map[string]bool)
 	for _, tl := range body.Tools {
@@ -382,7 +382,7 @@ func TestListToolsEndpoint(t *testing.T) {
 			t.Fatalf("工具 %q 缺少描述", tl.Name)
 		}
 	}
-	for _, want := range []string{"read_file", "write_file", "edit_file", "list_dir", "search"} {
+	for _, want := range []string{"read_file", "write_file", "edit_file", "list_dir", "search", "ask_user"} {
 		if !names[want] {
 			t.Fatalf("缺少工具 %q，实际: %v", want, names)
 		}

@@ -27,6 +27,11 @@ const (
 	TypeToolResult EventType = "tool.result"
 	// TypeToolApproval 工具需要人工审批（危险操作）。
 	TypeToolApproval EventType = "tool.approval"
+	// TypeAwaitingInput 本轮因等待用户回答而挂起（ask_user）。
+	//
+	// 与 done 的区别：done 表示「这一轮说完了」，awaiting_input 表示
+	// 「这一轮说了一半，等着用户给信息」。前端应显示输入提示而非完成态。
+	TypeAwaitingInput EventType = "awaiting.input"
 )
 
 // Usage token 用量。
@@ -74,6 +79,9 @@ type Event struct {
 
 	ToolCall   *ToolCall   // TypeToolCall / TypeToolApproval
 	ToolResult *ToolResult // TypeToolResult
+
+	// Suspended TypeAwaitingInput 时的挂起信息（含 session_id、待回答的问题）。
+	Suspended *session.Checkpoint
 
 	Err error // TypeError
 }

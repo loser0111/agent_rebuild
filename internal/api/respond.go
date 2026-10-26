@@ -20,6 +20,8 @@ const (
 	CodeSSEUnsupported   Code = "sse_unsupported"
 	CodeMethodNotAllowed Code = "method_not_allowed"
 	CodeNotFound         Code = "not_found"
+	// CodeConflict 状态冲突（如 resume 时该问题已被回答 / 已无挂起项）。
+	CodeConflict Code = "conflict"
 )
 
 // ErrorBody 统一错误体：{ "error": { code, message, request_id } }

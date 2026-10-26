@@ -110,40 +110,61 @@ type pendingCall struct {
 
 // appendArgs 把一个 arguments 片段并入累积缓冲。
 //
-// 为什么不能简单 WriteString：
-// OpenAI 官方流式协议里 arguments 是**增量片段**，逐帧拼接即可；
-// 但实测部分网关（含公司内部网关）每帧都发送**完整的** JSON，
-// 直接拼接会得到 `{}{"path":...}`，下游 json.Unmarshal 报
-// "invalid character '{' after top-level value"。
+// 核心问题：流式分片的边界是**任意的**，一个片段可能本身就是一个
+// 合法的 JSON 值：
 //
-// 判定策略（保持增量语义优先，避免破坏标准实现）：
-//  1. 缓冲区为空 → 直接写入
-//  2. 累积结果已是完整 JSON → 新片段若是完整 JSON 则替换（重复发送），
-//     否则视为续写（例如后续补齐尾部空格/字段）
-//  3. 累积结果不完整 → 追加
+//	分片序列:  {"path": "x", "recursive":  |  true  |  }
+//	片段 "true" 单独看是合法 JSON（布尔值 true）
+//
+// 早期版本用「两段都是合法 JSON 就判为重复发送、直接替换」的启发式，
+// 于是遇到 "true" 这种片段就把前面累积的内容整体丢弃，
+// 最终只剩 `true}` —— 表现为「前几次调用正常、后面突然失败」，
+// 因为分片边界取决于模型与网络，并非每次相同。
+//
+// 正确的判据不是「片段是否合法 JSON」，而是「片段是否是**完整对象**」：
+//   - arguments 的最终形态一定是 JSON **对象**（{...}）
+//   - 只有新片段本身是完整对象、且已累积内容也是完整对象时，
+//     才可能是重复发送完整参数
+//   - 其余情况一律按增量拼接
 func appendArgs(buf *strings.Builder, frag string) {
+	if frag == "" {
+		return
+	}
 	cur := buf.String()
-
 	if cur == "" {
 		buf.WriteString(frag)
 		return
 	}
 
-	if json.Valid([]byte(cur)) && json.Valid([]byte(frag)) {
-		// 已完整，且新片段自身也完整 → 重复发送完整参数，以后者为准。
+	// 仅在「两边都是完整 JSON 对象」时，才怀疑是重复发送完整参数。
+	// 用对象判据而非 json.Valid，避免把 true / 123 / "str" / [] 等
+	// 合法但非对象的片段误判成"完整参数"。
+	if isJSONObject(cur) && isJSONObject(frag) {
 		buf.Reset()
 		buf.WriteString(frag)
 		return
 	}
 
-	// 兜底：若拼接结果非法但新片段合法，说明是重复发送。
+	// 兜底：拼接后非法、但新片段是完整对象 → 说明前面积累的是坏数据，
+	// 用新片段覆盖（例如前缀是被截断的半个对象）。
 	joined := cur + frag
-	if !json.Valid([]byte(joined)) && json.Valid([]byte(frag)) {
+	if isJSONObject(frag) && !json.Valid([]byte(joined)) {
 		buf.Reset()
 		buf.WriteString(frag)
 		return
 	}
+
 	buf.WriteString(frag)
+}
+
+// isJSONObject 判断片段是否是一个完整的 JSON 对象（以 { 开头、} 结尾且可解析）。
+func isJSONObject(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	if len(trimmed) < 2 || trimmed[0] != '{' || trimmed[len(trimmed)-1] != '}' {
+		return false
+	}
+	var probe map[string]any
+	return json.Unmarshal([]byte(trimmed), &probe) == nil
 }
 
 func (l *LLMRunner) Run(ctx context.Context, req Request) <-chan Event {
@@ -354,6 +375,12 @@ func (l *LLMRunner) stream(ctx context.Context, rreq Request, out chan<- Event) 
 //
 // 因此这里做一次防御性清洗：收集所有有效的 tool_call_id，
 // 丢弃那些找不到前置的发起的 tool 消息。
+//
+// 反向的孤儿同样要处理（ask_user 挂起后会留下这种）：
+// assistant 声明了 tool_calls 却没有对应的 tool 结果。此时保留声明会让
+// OpenAI 报「'tool_calls' must be followed by tool messages」，用户挂起后
+// 随便发句话就会撞上 400，且完全看不出原因。做法是把这些未应答的调用
+// 从 assistant 消息里剔除；若剔除后既无文本又无调用，整条消息不发送。
 func (l *LLMRunner) toMessages(history []session.Message, systemPrompt string) []chatMessage {
 	if systemPrompt == "" {
 		systemPrompt = l.SystemPrompt
@@ -368,6 +395,14 @@ func (l *LLMRunner) toMessages(history []session.Message, systemPrompt string) [
 					declared[tc.ID] = true
 				}
 			}
+		}
+	}
+	// 第二遍：收集已经有结果应答的 tool_call id。
+	// 只有「声明 + 应答」齐全的调用才能安全发给模型。
+	answered := make(map[string]bool)
+	for _, m := range history {
+		if m.Role == session.RoleTool && m.ToolCallID != "" {
+			answered[m.ToolCallID] = true
 		}
 	}
 
@@ -395,7 +430,12 @@ func (l *LLMRunner) toMessages(history []session.Message, systemPrompt string) [
 			ToolCallID: m.ToolCallID,
 		}
 		// assistant 的工具调用请求必须原样回传，否则模型无法理解上下文。
+		// 但只回传「已经有结果」的那些：未应答的调用（如 ask_user 挂起后
+		// 用户没回答就继续问别的）留着会被 OpenAI 判为非法请求。
 		for _, tc := range m.ToolCalls {
+			if tc.ID != "" && !answered[tc.ID] {
+				continue
+			}
 			var ctc chatToolCall
 			ctc.ID = tc.ID
 			ctc.Type = "function"
@@ -404,7 +444,8 @@ func (l *LLMRunner) toMessages(history []session.Message, systemPrompt string) [
 			cm.ToolCalls = append(cm.ToolCalls, ctc)
 		}
 		// 空内容的 assistant 消息（只有 tool_calls）需保留，否则工具链断裂。
-		if m.Content == "" && len(m.ToolCalls) == 0 && m.ToolCallID == "" {
+		// 但若调用被全部剔除且没有文本，这条消息已无意义，跳过。
+		if m.Content == "" && len(cm.ToolCalls) == 0 && m.ToolCallID == "" {
 			continue
 		}
 		msgs = append(msgs, cm)
