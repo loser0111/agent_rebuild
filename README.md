@@ -17,6 +17,8 @@
 | [docs/09-tools.md](docs/09-tools.md) | **工具系统**：6 个内置工具、安全设计（路径隔离/环境白名单/进程组/截断）、审批机制、ReAct 多轮循环 |
 | [docs/10-markdown-rendering.md](docs/10-markdown-rendering.md) | **前端 Markdown 渲染**：支持的语法、链接协议白名单（防 XSS）、流式渲染鲁棒性、手写解析的坑 |
 | [docs/11-desktop-ui.md](docs/11-desktop-ui.md) | **桌面端界面适配**：hiddenInset 下的红绿灯避让、双击放大接线、文本选择策略、运行时验证 |
+| [docs/12-approval-modes.md](docs/12-approval-modes.md) | **审批模式设计**：manual/model/auto 三档、复用 ask_user 的挂起机制、`Approver` 接口改造 |
+| [docs/13-custom-tools-mcp.md](docs/13-custom-tools-mcp.md) | **自定义工具（MCP sidecar）**：Python 子进程 + 热编辑设计、Go MCP client、supervisor 重启策略、并发修复前提 |
 
 ## 一句话概览
 

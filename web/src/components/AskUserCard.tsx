@@ -17,8 +17,11 @@ import { useChat } from '../state/chatStore'
  * 只有 key 能把答案对应回具体问题。
  */
 export function AskUserCard() {
-  const { pendingQuestions, draftAnswers, isStreaming, resume, setDraftAnswer } = useChat()
+  const { pendingQuestions: allPending, draftAnswers, isStreaming, resume, setDraftAnswer } = useChat()
   const rootRef = useRef<HTMLDivElement>(null)
+
+  // 这个卡片只负责 ask_user 问答；审批卡片由 ApprovalCard 渲染。
+  const pendingQuestions = allPending.filter((q) => q.kind === 'input')
 
   // 出现新问题时聚焦第一个可输入控件。
   const signature = pendingQuestions.map((q) => q.key).join(',')
@@ -40,7 +43,7 @@ export function AskUserCard() {
     for (const q of pendingQuestions) {
       payload[q.key] = (draftAnswers[q.key] ?? '').trim()
     }
-    await resume(payload)
+    await resume({ answers: payload })
   }
 
   return (

@@ -24,6 +24,7 @@ import type {
   ResyncData,
   Session,
   SseEvent,
+  ToolApprovalData,
   ToolCallData,
   ToolCallView,
   ToolResultData,
@@ -50,12 +51,12 @@ export interface ChatState {
   reconnectHint: string | null
   lastEventId: number
   /**
-   * 挂起中的提问（ask_user）。非空时输入框应切换成问答卡片，
-   * 用户回答后走 resume 继续生成。
+   * 挂起中的提问/待审批操作（ask_user + 人工审批）。非空时输入区上方
+   * 应显示对应卡片，用户回答/决定后走 resume 继续生成。
    *
-   * 用列表而不是单个：同一轮里模型可能一次问多个问题
-   * （「你到哪一步了？」「要不要我改代码？」）。早期实现只保留
-   * 第一个，后面的问题在界面上直接消失。
+   * 用列表而不是单个：同一轮里模型可能一次问多个问题，或既问问题又
+   * 想做需要审批的操作（kind 字段区分两类，渲染成不同的卡片）。
+   * 早期实现只保留第一个，后面的问题在界面上直接消失。
    */
   pendingQuestions: PendingQuestion[]
   /**
@@ -321,8 +322,16 @@ interface ChatContextValue extends ChatState {
   sendMessage: (content: string) => Promise<void>
   stopGeneration: () => Promise<void>
   resync: () => Promise<void>
-  /** 回答挂起中的提问（ask_user）并继续生成；answers 以 call_id 为键。 */
-  resume: (answers: Record<string, string>) => Promise<void>
+  /**
+   * 回答挂起中的提问（ask_user）和/或提交人工审批决定，并继续生成。
+   * answers 以 call_id（或 call_id::qid）为键；decisions 以 call_id 为键，
+   * 值是 "approve" | "deny"；reason 是拒绝时的说明（可选）。
+   */
+  resume: (input: {
+    answers?: Record<string, string>
+    decisions?: Record<string, string>
+    reason?: string
+  }) => Promise<void>
   /** 更新某个问题的草稿答案（卡片与输入框共用） */
   setDraftAnswer: (callId: string, value: string) => void
   /** 清空所有草稿 */
@@ -390,6 +399,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       // 新接口返回 questions 列表；旧后端只给单个 call_id，做一次兼容。
       if (cp.questions?.length) {
         return cp.questions.map((q) => ({
+          kind: q.kind === 'approval' ? 'approval' : 'input',
           key: q.key || (q.qid ? `${q.call_id}::${q.qid}` : q.call_id),
           callId: q.call_id,
           qid: q.qid ?? '',
@@ -397,11 +407,16 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           question: q.question ?? '',
           options: q.options ?? [],
           multi: q.multi ?? false,
+          toolName: q.name,
+          toolArgs: q.args,
+          risk: q.risk,
+          reason: q.reason,
         }))
       }
       if (!cp.call_id) return []
       return [
         {
+          kind: 'input',
           key: cp.call_id,
           callId: cp.call_id,
           qid: '',
@@ -425,6 +440,43 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     },
     [fetchPending],
   )
+
+  /**
+   * 拉取服务端已落库的真实工具结果，替换指定 call_id 的乐观占位状态。
+   *
+   * 用途：人工审批"批准"之后，工具是在 /resume 请求内同步执行的，
+   * 但响应流里不会有 tool.result 事件（tool 消息是后端直接写库，
+   * 不走 SSE）。真实结果（成功/失败/输出内容）只能通过重新拉取
+   * 会话详情、从 role=tool 的消息里读出来。
+   *
+   * 只 patch 传入的 callIds，不整体替换 toolCalls：避免覆盖掉其他
+   * 不相关调用的状态，也避免整页消息列表重渲染带来的闪烁。
+   */
+  const syncToolResultsFromServer = useCallback(async (sessionId: string, callIds: string[]) => {
+    if (callIds.length === 0) return
+    try {
+      const detail = await api.getSession(sessionId)
+      const byCallId = new Map(
+        detail.messages
+          .filter((m) => m.role === 'tool' && m.tool_call_id)
+          .map((m) => [m.tool_call_id as string, m]),
+      )
+      for (const callId of callIds) {
+        const m = byCallId.get(callId)
+        if (!m) continue
+        dispatch({
+          type: 'tools/result',
+          payload: {
+            call_id: callId,
+            patch: { output: m.content, status: m.status === 'error' ? 'error' : 'success' },
+          },
+        })
+      }
+    } catch {
+      // 拉取失败不阻塞主流程：卡片会停在乐观占位状态（running），
+      // 用户仍可通过「重新同步」手动刷出真实结果。
+    }
+  }, [])
 
   /** 拉取会话详情（同时是断线后的兜底补齐路径）。 */
   const loadDetail = useCallback(async (id: string) => {
@@ -628,6 +680,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         const d = ev.data as AwaitingInputData
         settledRef.current = true
         dispatch({ type: 'pending/append', payload: {
+          kind: 'input',
           key: d.qid ? `${d.call_id}::${d.qid}` : d.call_id,
           callId: d.call_id,
           qid: d.qid ?? '',
@@ -637,6 +690,31 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           multi: d.multi ?? false,
         } })
         // 占位消息不该继续显示「生成中」的打字动画。
+        dispatch({
+          type: 'messages/patch',
+          payload: { id: d.message_id, patch: { status: 'streaming' } },
+        })
+        break
+      }
+      case 'tool.approval': {
+        // 人工审批模式下的写操作挂起：与 awaiting.input 同源的挂起机制，
+        // 但卡片语义是"批准/拒绝某个操作"而不是"回答一个问题"。
+        const d = ev.data as ToolApprovalData
+        settledRef.current = true
+        dispatch({ type: 'pending/append', payload: {
+          kind: 'approval',
+          key: d.call_id,
+          callId: d.call_id,
+          qid: '',
+          messageId: d.message_id,
+          question: '',
+          options: [],
+          multi: false,
+          toolName: d.name,
+          toolArgs: d.args,
+          risk: d.risk,
+          reason: d.reason,
+        } })
         dispatch({
           type: 'messages/patch',
           payload: { id: d.message_id, patch: { status: 'streaming' } },
@@ -756,17 +834,27 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   )
 
   /**
-   * 回答挂起中的提问，并继续生成。
+   * 回答挂起中的提问/提交审批决定，并继续生成。
    *
    * 与 sendMessage 的关键差异：
-   *   - 不再插入 user 消息。用户的回答会由后端落成一条 tool 消息，
+   *   - 不再插入 user 消息。用户的回答/决定会由后端落成一条 tool 消息，
    *     界面上应以「工具结果」而非「用户新提问」呈现，
    *     否则对话里会凭空多出一句用户没打过的话。
    *   - 只补一条 assistant 占位消息承载后续增量。
    *   - 请求走 /resume，带上 call_id 做幂等校验。
+   *
+   * answers 与 decisions 是两类独立的输入（对应 Pending.Kind 的两个分支），
+   * 同一轮里可能同时存在（模型既问了问题又想做需要审批的操作），
+   * 必须在同一次请求里一起提交——后端要求一次 resume 覆盖本轮全部待处理项。
    */
   const resume = useCallback(
-    async (answers: Record<string, string>) => {
+    async (input: {
+      answers?: Record<string, string>
+      decisions?: Record<string, string>
+      reason?: string
+    }) => {
+      const answers = input.answers ?? {}
+      const decisions = input.decisions ?? {}
       const sessionId = currentIdRef.current
       const pending = state.pendingQuestions
       if (!sessionId) {
@@ -777,7 +865,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         dispatch({ type: 'error/set', payload: '当前没有待回答的问题' })
         return
       }
-      if (Object.keys(answers).length === 0) return
+      if (Object.keys(answers).length === 0 && Object.keys(decisions).length === 0) return
       if (streamingRef.current) return
 
       // 先清掉挂起态：避免用户连点两次重复提交。
@@ -785,16 +873,32 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       dispatch({ type: 'pending/set', payload: [] })
       dispatch({ type: 'draft/reset' })
 
-      // 立刻把被回答的卡片从「调用中」翻成「完成」。
+      // 立刻把被回答/决定的卡片从「调用中」翻成对应状态。
       //
       // 为什么必须在这一刻做，而不是等后端事件：
       // resume 的响应流里只有后续生成的增量，**不会有** tool.result
       // （tool 消息是后端直接写库的，不发事件）。若不在这里主动收尾，
-      // 卡片会永远停在「调用中」——用户明明答过了，界面却显示还在等。
+      // 卡片会永远停在「调用中」——用户明明处理过了，界面却显示还在等。
       //
-      // 注意要用 callId 而不是提交键：卡片是按 call_id 索引的，
-      // 一次调用内的多个问题共享同一条卡片。
+      // answers 的乐观更新是准确的（答案文字就是最终结果）；
+      // decisions 的 deny 也准确（固定文案）；但 decisions 的 approve
+      // 结果取决于工具真实执行情况（可能失败），这里先占位成「调用中」，
+      // 下面 streamPost 结束后会用 syncApprovedResults 去拿真实结果替换。
       for (const q of pending) {
+        if (q.kind === 'approval') {
+          const decision = decisions[q.callId]
+          if (decision === 'deny') {
+            dispatch({
+              type: 'tools/result',
+              payload: {
+                call_id: q.callId,
+                patch: { status: 'rejected', output: '操作未执行：' + (input.reason || '用户拒绝了该操作') },
+              },
+            })
+          }
+          // approve：保持 running，等 syncApprovedResults 补真实结果。
+          continue
+        }
         const answer = answers[q.key]
         if (answer === undefined) continue
         dispatch({
@@ -805,6 +909,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           },
         })
       }
+
+      const approvedCallIds = Object.entries(decisions)
+        .filter(([, d]) => d === 'approve')
+        .map(([callId]) => callId)
 
       const assistantMsg = tempMessage('assistant', sessionId, '')
       const tempAssistantId = assistantMsg.id
@@ -819,7 +927,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       let failed: string | null = null
       await streamPost(
         `/api/sessions/${sessionId}/resume`,
-        { answers },
+        { answers, decisions, reason: input.reason },
         {
           onEvent: (ev) => {
             if (ev.event === 'message.start') {
@@ -847,15 +955,15 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
       if (failed) {
         // 提交失败：把消息标为错误，并重新同步挂起态，
-        // 让用户能改一下答案再试，而不是卡片凭空消失。
+        // 让用户能改一下答案/决定再试，而不是卡片凭空消失。
         const leftoverId = realAssistantId ?? tempAssistantId
         dispatch({
           type: 'messages/patch',
           payload: { id: leftoverId, patch: { status: 'error' } },
         })
-        // 回滚刚才的乐观更新：这些调用其实没被回答，
+        // 回滚刚才的乐观更新：这些调用其实没被处理，
         // 必须退回 running，否则卡片会显示「已完成」但问题还在。
-        for (const callId of Object.keys(answers)) {
+        for (const callId of [...Object.keys(answers), ...Object.keys(decisions)]) {
           dispatch({
             type: 'tools/result',
             payload: { call_id: callId, patch: { status: 'running' } },
@@ -864,6 +972,13 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         dispatch({ type: 'stream/end' })
         await restorePending(sessionId)
         return
+      }
+
+      // 批准的操作此刻已经被后端真正执行；把乐观占位的「调用中」
+      // 换成服务端落库的真实结果（可能成功也可能失败），否则用户会
+      // 一直看到「调用中」转圈，以为批准没起作用。
+      if (approvedCallIds.length > 0) {
+        await syncToolResultsFromServer(sessionId, approvedCallIds)
       }
 
       if (!settledRef.current && !controller.signal.aborted) {
@@ -898,7 +1013,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         /* 列表刷新失败不影响主流程 */
       }
     },
-    [handleEvent, restorePending, state.pendingQuestions],
+    [handleEvent, restorePending, syncToolResultsFromServer, state.pendingQuestions],
   )
 
   const stopGeneration = useCallback(async () => {

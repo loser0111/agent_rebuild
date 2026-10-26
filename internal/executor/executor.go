@@ -540,27 +540,16 @@ func (e *Executor) run(runCtx context.Context, task *Task, req Request, cancel c
 				// （OpenAI 要求 tool 结果紧跟其 tool_calls）。
 				e.appendToolCallMessage(persistCtx, req.SessionID, call)
 
-				// 第一轮不区分「需审批」与「普通调用」在事件层面的推送：
-				// 统一发 tool.call，不发 tool.approval。
+				// 统一发 tool.call，不区分「稍后可能需要人工审批」的调用。
 				//
-				// 原因：真正的审批拦截点在 loop.suspendAll，它只看
-				// Spec.Interactive（目前只有 ask_user），完全不看
-				// RequiresApproval——也就是说 run_command 这类
-				// RiskDangerous 工具本来就不会被服务端拦下来等人确认，
-				// 该走的执行一步没少。但事件名一旦分叉成 tool.approval，
-				// 前端 chatStore.tsx 的 handleEvent 里根本没有对应的 case，
-				// 会落进 default 被 console.debug 悄悄吞掉——调用本身
-				// 「正常执行了」但用户在界面上完全看不到过程，
-				// 后续 tool.result 到达时也因为找不到对应的卡片而变成
-				// message_id 为空的孤儿记录，永远挂不到任何消息下面。
-				//
-				// 目前还没有做真正的人工审批 UI（PendingApproval 只是
-				// 协议占位，见 session.Checkpoint 的注释），在这套 UI
-				// 落地之前，区分两种事件名只有"砍掉可见性"这一个实际效果，
-				// 没有任何审批上的收益。所以第一轮统一按普通调用处理：
-				// Risk / RequiresApproval 两个字段仍然原样透传给前端
-				// （ToolCallCard 会据此渲染"需确认"徽章，纯展示，不拦截），
-				// 为将来真正实现审批时保留接线点，但不再影响事件路由。
+				// 原因：此刻（模型刚流出这个 tool_call）审批决策还没算出来——
+				// Loop.Run 里 evaluateApprovals/suspendAll 发生在收集完
+				// 本轮全部 toolCalls **之后**，这个事件早在那之前就已经发出。
+				// 真正区分「会挂起等人」与「直接执行」的时机是下面的
+				// TypeAwaitingInput 分支：按 Pending.Kind 决定发 awaiting.input
+				// 还是 tool.approval。Risk / RequiresApproval 两个字段仍然
+				// 原样透传给前端（ToolCallCard 会据此渲染"需确认"徽章，纯展示），
+				// 为审批卡片保留足够的上下文。
 				task.Publish(sse.EventToolCall, func(seq uint64) any {
 					return sse.ToolCallData{
 						Seq: seq, SessionID: req.SessionID, MessageID: req.MessageID,
@@ -606,14 +595,30 @@ func (e *Executor) run(runCtx context.Context, task *Task, req Request, cancel c
 				task.status = StatusSucceeded
 				task.mu.Unlock()
 
-				// 一个问题一个事件：前端可以逐个渲染卡片，
-				// 也保持与旧客户端的兼容（旧代码只认第一个 call_id）。
+				// 按挂起原因分流成两种事件：
+				//   - PendingInput（ask_user）  → awaiting.input，前端渲染问答卡片；
+				//   - PendingApproval（人工审批）→ tool.approval，前端渲染批准/拒绝卡片。
+				//
+				// 两者可能出现在同一条 checkpoint 里（模型同轮既问问题又想写文件），
+				// 必须按各自的 Kind 分别发对应事件，否则其中一类会在前端
+				// 找不到渲染分支（旧版本只认 awaiting.input，tool.approval
+				// 事件虽已定义多时但从未被 Publish 过，见 09-tools.md 已知限制）。
 				//
 				// qid 必须带上：多个问题可能属于**同一个** call_id
 				// （ask_user 一次调用里的 questions 数组），
 				// 前端只有靠 qid 才能把答案对应回具体问题。
 				for _, p := range cp.Pendings {
 					pending := p
+					if pending.Kind == session.PendingApproval {
+						task.Publish(sse.EventToolApproval, func(seq uint64) any {
+							return sse.ToolApprovalData{
+								Seq: seq, SessionID: req.SessionID, MessageID: req.MessageID,
+								CallID: pending.CallID, Name: pending.Name, Args: pending.Args,
+								Risk: pending.Risk, Reason: pending.Reason,
+							}
+						})
+						continue
+					}
 					task.Publish(sse.EventAwaitingInput, func(seq uint64) any {
 						return sse.AwaitingInputData{
 							Seq: seq, SessionID: req.SessionID, MessageID: req.MessageID,

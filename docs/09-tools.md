@@ -220,7 +220,7 @@ TOOL_TIMEOUT=120s
 
 | 限制 | 说明 |
 | --- | --- |
-| 审批为自动策略 | 当前按危险等级自动放行/拒绝，尚未接入「前端弹窗等用户点确认」的交互式审批。`Approver` 接口已就绪，接 UI 只需实现一个走 SSE + REST 的 Approver |
+| ~~审批为自动策略~~ | 已实现三种模式（manual/model/auto），见 [docs/12-approval-modes.md](12-approval-modes.md) |
 | 无子代理 | subagent 未实现 |
 | 无 MCP | 未接入 MCP 工具源 |
 | 符号链接未解析 | 路径校验用 `filepath.Rel` 前缀检查，未 `EvalSymlinks`。工作区内指向外部的符号链接可能绕过限制（本地单用户场景风险低，多用户需加固） |
@@ -298,7 +298,7 @@ if m.Role == session.RoleTool && !declared[m.ToolCallID] {
 
 ## 9. 后续可做
 
-1. **交互式审批**：把 `AutoApprover` 换成「发 `tool.approval` 事件 → 等 `POST /approve`」
+1. ~~**交互式审批**：把 `AutoApprover` 换成「发 `tool.approval` 事件 → 等 `POST /approve`」~~ 已实现（见 [docs/12-approval-modes.md](12-approval-modes.md)）：三种审批模式（manual/model/auto），manual 复用 ask_user 的挂起机制，走 `POST /resume` 的 `decisions` 字段。
 2. **MCP 接入**：`modelcontextprotocol/go-sdk` 的工具适配成 `tool.Tool` 接口
 3. **子代理**：复用 Loop，独立上下文与工具集
-4. **审计表**：记录工具调用的完整参数与结果，便于回溯
+4. **审计表**：记录工具调用的完整参数与结果，便于回溯（ModelApprover 的裁决过程也应纳入审计）

@@ -1557,6 +1557,121 @@ kbd {
   cursor: not-allowed;
 }
 
+/* ---- 审批卡片：人工审批模式下的批准/拒绝操作 ---- */
+
+.approval-card {
+  max-width: 860px;
+  margin: 0 auto 8px;
+  padding: 12px 14px 10px;
+  border: 1px solid var(--danger);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, var(--danger-soft), var(--bg-input) 60%);
+  box-shadow: 0 0 0 1px var(--danger-soft), 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.approval-badge {
+  padding: 1px 7px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 999px;
+  color: var(--danger);
+  background: var(--danger-soft);
+  border: 1px solid rgba(229, 72, 77, 0.35);
+}
+
+.approval-item {
+  padding-bottom: 8px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.approval-item:last-of-type {
+  border-bottom: none;
+}
+
+.approval-item-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+
+.approval-reason {
+  margin-bottom: 6px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+}
+
+.approval-decided {
+  margin-left: auto;
+  padding: 1px 7px;
+  font-size: 11px;
+  font-weight: 500;
+  border-radius: 999px;
+}
+
+.approval-decided.is-approve {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.approval-decided.is-deny {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.approval-item-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.approval-deny-box {
+  margin-top: 6px;
+}
+
+.approval-btn {
+  padding: 6px 16px;
+  font-size: 12.5px;
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-panel);
+  color: var(--text-soft);
+  transition: opacity 0.12s ease, border-color 0.12s ease, background 0.12s ease, color 0.12s ease;
+}
+
+.approval-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text);
+}
+
+.approval-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.approval-btn.is-approve {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.approval-btn.is-approve.is-selected {
+  color: var(--bg);
+  background: var(--accent);
+}
+
+.approval-btn.is-deny {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.approval-btn.is-deny.is-selected {
+  color: var(--bg);
+  background: var(--danger);
+}
+
 .composer-box {
   max-width: 860px;
   margin: 0 auto;

@@ -62,15 +62,34 @@ func NewServer(cfg *config.Config, store session.Store, runner agent.Runner, loc
 
 // SetTools 启用工具系统。
 //
-// 默认审批策略：只读工具直接执行，写文件允许（核心能力），
-// 命令执行需要显式开启（cfg.EnableCommandTool）。
+// 按 cfg.ApprovalMode 装配对应的 Approver（见 docs/12-approval-modes.md）：
+//   - manual：一切需要审批的操作挂起等人工点击（默认，最安全）；
+//   - model：由一次独立的模型调用（judge）当场裁决，不挂起；
+//   - auto：完全自动放行，命令执行仍受 cfg.EnableCommandTool 单独把关
+//     （审批模式与"命令工具是否存在"是两个独立开关，不应互相替代，
+//     比照 Codex CLI 的 sandbox_mode 与 approval_policy 解耦设计）。
 func (s *Server) SetTools(registry *tool.Registry, systemPrompt string, maxSteps int, timeout time.Duration) {
 	if registry == nil {
 		return
 	}
-	approver := loop.AutoApprover{
-		AllowModerate:  true,
-		AllowDangerous: s.cfg.EnableCommandTool,
+	var approver loop.Approver
+	switch s.cfg.ApprovalMode {
+	case config.ApprovalManual:
+		approver = loop.ManualApprover{}
+	case config.ApprovalModel:
+		// 复用对话用的默认 Runner 当判官：零额外配置成本。
+		// 如果将来想用更便宜的模型专门当判官，可以在这里按
+		// 一个独立的模型配置 ID 解析出另一个 Runner 再传入。
+		approver = loop.ModelApprover{
+			Judge:      s.runner,
+			Timeout:    s.cfg.JudgeTimeout,
+			FailClosed: !s.cfg.JudgeFailOpen,
+		}
+	default: // config.ApprovalAuto
+		approver = loop.AutoApprover{
+			AllowModerate:  true,
+			AllowDangerous: s.cfg.EnableCommandTool,
+		}
 	}
 	s.exec.SetTools(registry, systemPrompt, maxSteps, timeout, approver)
 	s.tools = registry

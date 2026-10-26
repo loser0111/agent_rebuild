@@ -220,6 +220,20 @@ export interface ToolResultData {
   duration_ms: number
 }
 
+/** tool.approval：需要人工审批（人工审批模式下的写操作，挂起等人点击）。 */
+export interface ToolApprovalData {
+  seq: number
+  session_id: string
+  message_id: string
+  call_id: string
+  name: string
+  /** 参数的 JSON 字符串（原样保留，可能不是合法 JSON）。 */
+  args: string
+  risk: ToolRisk
+  /** 审批器给出的说明（例如"等待用户确认"/判官模型的裁决理由）。 */
+  reason?: string
+}
+
 /** 前端聚合后的工具调用视图模型 */
 export interface ToolCallView {
   call_id: string
@@ -265,13 +279,20 @@ export interface CheckpointResponse {
   state?: string
   /** 本轮所有待回答项（新格式）。 */
   questions?: Array<{
+    /** 挂起类型："input"（ask_user 问答）或 "approval"（人工审批）。 */
+    kind?: string
     call_id: string
     qid?: string
     /** 提交时使用的键：call_id 或 call_id::qid */
     key?: string
-    question: string
+    question?: string
     options?: string[]
     multi?: boolean
+    /** 以下三个仅 kind="approval" 时有值。 */
+    name?: string
+    args?: string
+    risk?: ToolRisk
+    reason?: string
   }>
   /** 首个问题的扁平字段（兼容旧前端）。 */
   call_id?: string
@@ -283,7 +304,9 @@ export interface CheckpointResponse {
 
 /** 前端持有的「待回答提问」视图模型。 */
 export interface PendingQuestion {
-  /** 提交时使用的键：call_id 或 call_id::qid */
+  /** 挂起类型：'input' = ask_user 问答，'approval' = 人工审批写操作。 */
+  kind: 'input' | 'approval'
+  /** 提交时使用的键：call_id 或 call_id::qid（仅 kind='input' 时有意义）。 */
   key: string
   callId: string
   qid: string
@@ -292,7 +315,13 @@ export interface PendingQuestion {
   options: string[]
   /** 是否允许多选 */
   multi: boolean
+  /** 以下四个仅 kind='approval' 时有值。 */
+  toolName?: string
+  toolArgs?: string
+  risk?: ToolRisk
+  reason?: string
 }
+
 
 export interface SseEvent {
   id: number | null

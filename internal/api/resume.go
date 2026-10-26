@@ -26,6 +26,7 @@ import (
 
 	"log/slog"
 
+	"agent_rebuild/internal/agent/loop"
 	"agent_rebuild/internal/executor"
 	"agent_rebuild/internal/session"
 )
@@ -41,6 +42,15 @@ type resumeRequest struct {
 	// 与 CallID/Answer 两种形式都支持：单问题用前者（旧客户端兼容），
 	// 多问题用后者一次提交，避免反复建连。
 	Answers map[string]string `json:"answers"`
+	// Decisions 人工审批的决定：call_id -> "approve" | "deny"。
+	//
+	// 与 Answers 分开是刻意的：两者语义完全不同——Answers 的值直接就是
+	// tool 结果（ask_user），而 Decisions 的值只是"批不批"，批准后还要
+	// 真正执行工具才能产出 tool 结果（见 loop.ExecuteApproved）。混在一个
+	// 字段里会让"回答文字"和"审批决定"的处理逻辑互相污染。
+	Decisions map[string]string `json:"decisions"`
+	// Reason 拒绝审批时的理由（可选），会作为"操作未执行"的说明回喂给模型。
+	Reason string `json:"reason"`
 	// Stream 是否以 SSE 返回后续生成（默认 true）。
 	Stream *bool `json:"stream"`
 }
@@ -71,9 +81,21 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 	if req.CallID != "" && req.Answer != "" {
 		answers[req.CallID] = req.Answer
 	}
-	if len(answers) == 0 {
+
+	// 归一化 decisions 映射：键是 call_id，值是 "approve" / "deny"（大小写容错）。
+	//
+	// 与 answers 分开校验/处理：两者对应 Pending.Kind 的两个分支，详见下方。
+	decisions := make(map[string]string, len(req.Decisions))
+	for k, v := range req.Decisions {
+		if k = strings.TrimSpace(k); k == "" {
+			continue
+		}
+		decisions[k] = strings.ToLower(strings.TrimSpace(v))
+	}
+
+	if len(answers) == 0 && len(decisions) == 0 {
 		respondError(w, r, http.StatusBadRequest, CodeInvalidArgument,
-			"需要提供 call_id + answer，或 answers 映射")
+			"需要提供 call_id + answer、answers 映射，或 decisions 映射")
 		return
 	}
 
@@ -111,37 +133,68 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 幂等/一致性校验：提交的答案必须都能对上当前挂起项。
+	// 幂等/一致性校验：提交的答案/决定必须都能对上当前挂起项。
 	//
-	// 支持两种键：
+	// answers 的键支持两种形式：
 	//   - "call_id"           单问题调的简写
 	//   - "call_id::qid"      同一调用内多问题的精确写法
+	// decisions 的键是 call_id，值必须是 "approve" 或 "deny"。
 	//
 	// 只要有一个对不上就整体拒绝并说明原因，而不是部分接受——
-	// 部分接受会让 checkpoint 处于「一半已回答」的中间态，
+	// 部分接受会让 checkpoint 处于「一半已处理」的中间态，
 	// 而模型拿到残缺的 tool 结果会做出奇怪的推断。
+	approvalPendings := make(map[string]session.Pending, len(cp.Pendings))
+	for _, p := range cp.Pendings {
+		if p.Kind == session.PendingApproval {
+			approvalPendings[p.CallID] = p
+		}
+	}
+
 	var unknown []string
 	for key := range answers {
 		if _, ok := findByAnswerKey(cp.Pendings, key); !ok {
 			unknown = append(unknown, key)
 		}
 	}
+	for callID := range decisions {
+		if _, ok := approvalPendings[callID]; !ok {
+			unknown = append(unknown, callID)
+		}
+	}
 	if len(unknown) > 0 {
 		respondError(w, r, http.StatusConflict, CodeConflict,
-			"以下问题已被回答或已被新问题取代："+strings.Join(unknown, ", ")+
+			"以下问题/操作已被处理或已被新一轮取代："+strings.Join(unknown, ", ")+
 				"；请刷新会话查看最新状态")
 		return
 	}
-	// 数量校验：每个 Pending 都必须有答案。
+
+	// 数量与取值校验：每个 Pending 都必须被覆盖，审批决定只能是 approve/deny。
 	missing := make([]string, 0)
+	var invalidDecisions []string
 	for _, p := range cp.Pendings {
+		if p.Kind == session.PendingApproval {
+			d, ok := decisions[p.CallID]
+			if !ok {
+				missing = append(missing, p.CallID)
+				continue
+			}
+			if d != "approve" && d != "deny" {
+				invalidDecisions = append(invalidDecisions, p.CallID+"="+d)
+			}
+			continue
+		}
 		if _, ok := answerFor(answers, p); !ok {
 			missing = append(missing, answerKeyOf(p))
 		}
 	}
+	if len(invalidDecisions) > 0 {
+		respondError(w, r, http.StatusBadRequest, CodeInvalidArgument,
+			"decisions 的值只能是 approve 或 deny，以下不合法："+strings.Join(invalidDecisions, ", "))
+		return
+	}
 	if len(missing) > 0 {
 		respondError(w, r, http.StatusBadRequest, CodeInvalidArgument,
-			"还有 "+itoa(len(missing))+" 个问题未回答，请一并提交："+
+			"还有 "+itoa(len(missing))+" 项未处理，请一并提交："+
 				strings.Join(missing, ", "))
 		return
 	}
@@ -153,7 +206,7 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ---- 关键一步：把答复写成 tool 结果 ----
+	// ---- 关键一步：把答复/审批决定写成 tool 结果 ----
 	//
 	// 挂起时落库的每条 assistant(tool_calls) 都必须有且只有一条配对结果，
 	// 历史才是合法的一轮。这里按 call_id 分组：
@@ -161,6 +214,10 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 	//   - 一个 ask_user 调用里含多个问题时，它们的 CallID 相同、QID 不同，
 	//     必须**合并成一条** tool 结果（模型期望的是「一个调用一个结果」）。
 	//     把多个问题拆成多条 tool 消息会让 OpenAI 直接 400。
+	//   - PendingApproval 每个 call_id 只会有一条 Pending（没有 QID 细分），
+	//     但处理方式和 PendingInput 完全不同：decision=approve 时要先真正
+	//     执行工具（见 loop.ExecuteApproved），不能把"已批准"当成结果；
+	//     decision=deny 时产出"操作未执行"，工具从未被调用。
 	//   - 多个 call_id 时各自一条。
 	//
 	// 按 Pendings 的原顺序处理：OpenAI 要求 tool 消息的排列对应
@@ -176,13 +233,45 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 
 	for _, callID := range callOrder {
 		group := byCall[callID]
-		content := composeAnswer(group, answers)
+		kind := group[0].Kind // 同一 call_id 的 Pendings Kind 必须一致（由 suspendAll 保证）。
+
+		var content string
+		status := session.StatusComplete
+
+		switch kind {
+		case session.PendingApproval:
+			p := group[0]
+			switch decisions[callID] {
+			case "deny":
+				reason := strings.TrimSpace(req.Reason)
+				if reason == "" {
+					reason = "用户拒绝了该操作"
+				}
+				content = "操作未执行：" + reason
+				status = session.StatusError
+
+			case "approve":
+				// 这里才是工具第一次真正被执行：挂起期间它只是"待批准"，
+				// 从未调用 registry.Invoke。批准之后必须真正执行并把
+				// 真实结果喂给模型，不能用"已批准"这几个字充数，
+				// 否则模型会以为文件已经写好，但实际上什么都没发生。
+				result := loop.ExecuteApproved(ctx, s.tools, s.cfg.ToolTimeout, callID, p.Name, p.Args)
+				content = result.Output
+				if result.IsError {
+					status = session.StatusError
+				}
+			}
+
+		default: // session.PendingInput
+			content = composeAnswer(group, answers)
+		}
+
 		toolMsg := &session.Message{
 			ID:         session.NewMessageID(),
 			SessionID:  sessionID,
 			Role:       session.RoleTool,
 			Content:    content,
-			Status:     session.StatusComplete,
+			Status:     status,
 			ToolCallID: callID,
 		}
 		if err := s.store.AppendMessage(ctx, toolMsg); err != nil {
@@ -301,17 +390,24 @@ func (s *Server) handleGetCheckpoint(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 同时返回 questions 列表与首个问题的扁平字段：
-	//   - 新前端用 questions 一次渲染全部卡片；
-	//   - 旧前端（只认 call_id/question）仍能工作。
+	//   - 新前端用 questions 一次渲染全部卡片（按 kind 区分问答卡片/审批卡片）；
+	//   - 旧前端（只认 call_id/question）仍能工作——旧字段对 PendingApproval
+	//     项没有意义（Question 为空），但不影响旧前端已有的问答场景。
 	questions := make([]map[string]any, 0, len(cp.Pendings))
 	for _, p := range cp.Pendings {
 		questions = append(questions, map[string]any{
+			"kind":     string(p.Kind),
 			"call_id":  p.CallID,
 			"qid":      p.QID,
 			"key":      answerKeyOf(p),
 			"question": p.Question,
 			"options":  p.Options,
 			"multi":    p.Multi,
+			// 以下三个仅 kind=approval 时有值。
+			"name":   p.Name,
+			"args":   p.Args,
+			"risk":   p.Risk,
+			"reason": p.Reason,
 		})
 	}
 	first := cp.Pendings[0]

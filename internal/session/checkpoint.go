@@ -29,7 +29,10 @@ const (
 	PendingInput PendingKind = "input"
 	// PendingApproval 等待用户授权（危险工具）。
 	//
-	// 目前审批系统尚未开放，该值仅作为协议占位，不会被写入。
+	// 与 PendingInput 的关键差异：人的回答文字本身**不是**工具结果。
+	// resume 时若 decision=approve，要先真正执行该工具（见
+	// loop.ExecuteApproved），再把执行结果喂给模型；decision=deny 则
+	// 产出一条"操作未执行"的结果，工具从未被调用。
 	PendingApproval PendingKind = "approval"
 )
 
@@ -61,6 +64,16 @@ type Pending struct {
 	// 有多个问题。前端要用 QID 把答案对应回具体问题，
 	// 否则多问题时答案会串。
 	QID string `json:"qid,omitempty"`
+	// Risk 该工具调用的危险等级（safe/moderate/dangerous）。
+	//
+	// 只在 Kind=PendingApproval 时有值：前端据此渲染风险徽章，
+	// 不需要反查工具注册表。ask_user（Kind=PendingInput）始终是
+	// RiskSafe，不需要展示，故留空。
+	Risk string `json:"risk,omitempty"`
+	// Reason 审批器给出的说明（例如"等待用户确认"/判官模型的裁决理由）。
+	//
+	// 只在 Kind=PendingApproval 时有值，展示给用户了解"为什么需要我批准"。
+	Reason string `json:"reason,omitempty"`
 }
 
 // Clone 深拷贝 Options，避免共享底层数组。

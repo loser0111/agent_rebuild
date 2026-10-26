@@ -127,6 +127,11 @@ e2e-ask-user:
 e2e-multi-question:
 	@bash scripts/e2e-multi-question.sh
 
+## e2e-approval: 人工审批（manual 模式）验证：批准后真执行、拒绝后不执行
+.PHONY: e2e-approval
+e2e-approval:
+	@bash scripts/e2e-approval.sh
+
 ## demo: 构建并启动单端口 Demo（浏览器访问 http://localhost:8080）
 .PHONY: demo
 demo: build-binary

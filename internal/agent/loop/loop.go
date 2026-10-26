@@ -42,7 +42,8 @@ type Config struct {
 	ToolTimeout time.Duration
 	// SystemPrompt 系统提示。
 	SystemPrompt string
-	// Approver 审批回调：返回 true 表示允许执行。
+	// Approver 审批回调，决定每个工具调用是放行、拒绝，还是挂起等人工决定
+	// （见 ApprovalDecision）。
 	//
 	// 为 nil 时按「工具危险等级」自动决定：Safe 直接执行，
 	// Moderate/Dangerous 一律拒绝（安全默认）。
@@ -60,16 +61,51 @@ type Config struct {
 	Checkpointer session.CheckpointStore
 }
 
-// Approver 决定某个工具调用是否需要用户确认，以及是否已获批准。
+// ApprovalDecision 是审批结果的三种状态。
 //
-// 返回值 approved=false 时，该调用不会执行，而是把「被拒绝」
-// 作为工具结果回喂给模型（模型应据此换一种方式）。
-type Approver interface {
-	// Approve 在工具执行前调用。allowed=false 表示拒绝。
-	Approve(ctx context.Context, call agent.ToolCall) (allowed bool, reason string)
+// 为什么不是 bool：人工审批（ManualApprover）无法在一次函数调用内
+// 当场给出结论，必须能表达"既不是允许也不是拒绝，而是要挂起等人"，
+// 这正是 AwaitingHuman 存在的原因。
+type ApprovalDecision int
+
+const (
+	// Denied 拒绝执行：不会运行该工具，把拒绝理由作为工具结果回喂给模型。
+	Denied ApprovalDecision = iota
+	// Approved 允许执行。
+	Approved
+	// AwaitingHuman 无法当场决定，需要挂起等待人工在前端点击批准/拒绝。
+	//
+	// 只有依赖人工的 Approver（如 ManualApprover）会返回这个值；
+	// AutoApprover / ModelApprover 永远返回 Denied 或 Approved——
+	// 它们都能在一次函数调用内给出结论，不需要挂起。
+	AwaitingHuman
+)
+
+// String 便于日志与 checkpoint 展示。
+func (d ApprovalDecision) String() string {
+	switch d {
+	case Approved:
+		return "approved"
+	case AwaitingHuman:
+		return "awaiting_human"
+	default:
+		return "denied"
+	}
 }
 
-// AutoApprover 是基于危险等级的默认审批器。
+// Approver 决定某个工具调用是否需要用户确认，以及是否已获批准。
+//
+// 三种返回值分别对应：
+//   - Denied：不会执行，把「被拒绝」作为工具结果回喂给模型（模型应据此换一种方式）；
+//   - Approved：正常执行；
+//   - AwaitingHuman：既不执行也不拒绝，挂起等待人工决定——与 ask_user 共用
+//     suspendAll/checkpoint 机制，人工决定通过 /resume 的 Decisions 字段回传。
+type Approver interface {
+	// Approve 在工具执行前调用（Safe 工具不会走到这里，见 evaluateApprovals）。
+	Approve(ctx context.Context, call agent.ToolCall) (ApprovalDecision, string)
+}
+
+// AutoApprover 是基于危险等级的默认审批器，永远当场给出结论（不会返回 AwaitingHuman）。
 //
 // 策略（安全默认）：
 //   - RiskSafe：直接执行（只读，无副作用）
@@ -83,21 +119,33 @@ type AutoApprover struct {
 }
 
 // Approve 实现 Approver。
-func (a AutoApprover) Approve(_ context.Context, call agent.ToolCall) (bool, string) {
+func (a AutoApprover) Approve(_ context.Context, call agent.ToolCall) (ApprovalDecision, string) {
 	switch call.Risk {
 	case tool.RiskSafe:
-		return true, ""
+		return Approved, ""
 	case tool.RiskModerate:
 		if a.AllowModerate {
-			return true, ""
+			return Approved, ""
 		}
-		return false, "该操作会修改文件，需要用户确认"
+		return Denied, "该操作会修改文件，需要用户确认"
 	default:
 		if a.AllowDangerous {
-			return true, ""
+			return Approved, ""
 		}
-		return false, "该操作会执行命令，需要用户确认"
+		return Denied, "该操作会执行命令，需要用户确认"
 	}
+}
+
+// ManualApprover 把一切需要审批的调用都转交人工决定，自己不做判断。
+//
+// 永远返回 AwaitingHuman：真正的决定发生在 suspendAll 把调用挂起之后，
+// 由前端 /resume 请求的 Decisions 字段携带人工点击结果回来
+// （approve → 真正执行工具；deny → 产出"操作未执行"）。
+type ManualApprover struct{}
+
+// Approve 实现 Approver。
+func (ManualApprover) Approve(_ context.Context, _ agent.ToolCall) (ApprovalDecision, string) {
+	return AwaitingHuman, "等待用户确认"
 }
 
 // Loop 执行完整的「模型 + 工具」对话。
@@ -316,17 +364,24 @@ func (l *Loop) Run(ctx context.Context, history []session.Message, out chan<- ag
 		// 下次请求会被 OpenAI 拒绝（tool 必须是对 tool_calls 的响应）。
 		res.AssistantMessages = append(res.AssistantMessages, assistant)
 
-		// ---- 先处理同轮的所有交互型调用 ----
+		// ---- 审批决策：先算一次，结果在本轮内复用 ----
 		//
-		// 为什么必须先统一扫描再执行：模型经常一口气抛多个问题
-		// （「你到哪一步了？」「要不要我改代码？」）。早期实现在
-		// executeOne 里遇到第一个交互调用就挂起并 return，同轮后面的
-		// 问题既不执行、也不落 checkpoint——用户完全看不到它们，
-		// 表现为「问题静默消失」。
+		// 为什么要先算好再用两次（suspendAll 判断是否挂起、executeOne 判断
+		// 是否执行）：对 ModelApprover 来说 Approve() 是一次真实的 LLM 调用，
+		// 有延迟也有成本，不能在同一轮里被触发两次。
+		outcomes := l.evaluateApprovals(ctx, toolCalls)
+
+		// ---- 先统一处理同轮里所有"要挂起"的调用 ----
 		//
-		// 现在改成：把同轮所有交互型调用收集成一次挂起，
-		// 一条 checkpoint 里存全部 Pendings，前端一次展示多个问题。
-		if l.suspendAll(ctx, toolCalls, out, step) {
+		// 两类都要挂起：交互型调用（ask_user）与审批结果为 AwaitingHuman
+		// 的调用（人工审批模式下的写操作）。为什么必须先统一扫描再执行：
+		// 模型经常一口气抛多个问题/操作。早期实现在 executeOne 里遇到
+		// 第一个交互调用就挂起并 return，同轮后面的问题既不执行、也不落
+		// checkpoint——用户完全看不到它们，表现为「问题静默消失」。
+		//
+		// 现在改成：把同轮所有需要挂起的调用收集成一次挂起，
+		// 一条 checkpoint 里存全部 Pendings，前端一次展示多个问题/待批操作。
+		if l.suspendAll(ctx, toolCalls, outcomes, out, step) {
 			return res, nil
 		}
 
@@ -334,7 +389,7 @@ func (l *Loop) Run(ctx context.Context, history []session.Message, out chan<- ag
 			// 记录当前步号，挂起时写进 checkpoint。
 			l.stepIndex = step
 
-			result := l.executeOne(ctx, call)
+			result := l.executeOne(ctx, call, outcomes[call.ID])
 
 			// 兜底：executeOne 里若因为降级失败而返回交互型调用，
 			// 上面 suspendAll 已经处理过，正常不会走到这里。
@@ -381,8 +436,34 @@ func (l *Loop) Run(ctx context.Context, history []session.Message, out chan<- ag
 	return res, nil
 }
 
+// approvalOutcome 是一次审批决策的结果，在本轮内缓存复用（见 evaluateApprovals）。
+type approvalOutcome struct {
+	decision ApprovalDecision
+	reason   string
+}
+
+// evaluateApprovals 对本轮全部工具调用做一次审批决策，按 CallID 缓存结果。
+//
+// Safe 工具（call.RequiresApproval == false）直接记为 Approved，不占用
+// Approver：没必要为"读文件"这种无副作用操作付出一次模型审批的延迟与成本，
+// 这与原先 AutoApprover 对 RiskSafe 的处理是一致的默认行为。
+func (l *Loop) evaluateApprovals(ctx context.Context, calls []agent.ToolCall) map[string]approvalOutcome {
+	out := make(map[string]approvalOutcome, len(calls))
+	for _, call := range calls {
+		if !call.RequiresApproval {
+			out[call.ID] = approvalOutcome{Approved, ""}
+			continue
+		}
+		decision, reason := l.cfg.Approver.Approve(ctx, call)
+		out[call.ID] = approvalOutcome{decision, reason}
+	}
+	return out
+}
+
 // executeOne 执行单个工具调用（含审批与超时）。
-func (l *Loop) executeOne(ctx context.Context, call agent.ToolCall) agent.ToolResult {
+//
+// outcome 是本轮 evaluateApprovals 算好的审批结果（不会在这里重新调用 Approver）。
+func (l *Loop) executeOne(ctx context.Context, call agent.ToolCall, outcome approvalOutcome) agent.ToolResult {
 	start := time.Now()
 	result := agent.ToolResult{CallID: call.ID, Name: call.Name}
 
@@ -411,9 +492,9 @@ func (l *Loop) executeOne(ctx context.Context, call agent.ToolCall) agent.ToolRe
 		return l.suspend(ctx, call, start)
 	}
 
-	// 审批。
-	allowed, reason := l.cfg.Approver.Approve(ctx, call)
-	if !allowed {
+	switch outcome.decision {
+	case Denied:
+		reason := outcome.reason
 		if reason == "" {
 			reason = "用户未授权此操作"
 		}
@@ -423,12 +504,39 @@ func (l *Loop) executeOne(ctx context.Context, call agent.ToolCall) agent.ToolRe
 		result.IsError = true
 		result.DurationMs = time.Since(start).Milliseconds()
 		return result
+
+	case AwaitingHuman:
+		// 正常不会走到这里：suspendAll 已经把 AwaitingHuman 的调用截走挂起了。
+		// 只有「无法挂起」的降级场景（无 SessionID/无 Checkpointer，见 suspendAll
+		// 的安全分支）才会落到这里，处理方式与 ask_user 的降级完全一致：
+		// 返回错误结果，不执行，让模型自己继续。
+		result.Output = "操作未执行：当前环境不支持人工审批，且无法保存待确认的操作"
+		result.Rejected = true
+		result.IsError = true
+		result.DurationMs = time.Since(start).Milliseconds()
+		return result
 	}
 
-	toolCtx, cancel := context.WithTimeout(ctx, l.cfg.ToolTimeout)
+	// Approved：真正执行。
+	return runTool(ctx, l.cfg.Registry, l.cfg.ToolTimeout, call.ID, call.Name, call.Args, start)
+}
+
+// runTool 执行一次已经获得批准的工具调用，统一计时与错误包装。
+//
+// 抽成独立函数的原因：executeOne 的 Approved 分支与 ExecuteApproved
+// （供 API 层 /resume 的人工批准路径调用）需要完全一致的执行逻辑——
+// 两处各写一遍容易在"怎么算耗时""怎么包装错误"上跑偏，导致同一个
+// "批准后执行"动作在两条路径上行为不一致。
+func runTool(
+	ctx context.Context, registry *tool.Registry, timeout time.Duration,
+	callID, name, args string, start time.Time,
+) agent.ToolResult {
+	result := agent.ToolResult{CallID: callID, Name: name}
+
+	toolCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	res, err := l.cfg.Registry.Invoke(toolCtx, call.Name, json.RawMessage(call.Args))
+	res, err := registry.Invoke(toolCtx, name, json.RawMessage(args))
 	result.DurationMs = time.Since(start).Milliseconds()
 	if err != nil {
 		result.Output = "工具执行失败：" + err.Error()
@@ -438,6 +546,37 @@ func (l *Loop) executeOne(ctx context.Context, call agent.ToolCall) agent.ToolRe
 	result.Output = res.Output
 	result.IsError = res.IsError
 	return result
+}
+
+// ExecuteApproved 执行一个已经被人工批准的工具调用。
+//
+// 供 API 层 /resume 处理 PendingApproval 且 decision=approve 时调用：
+// 这个场景下工具此前因为 AwaitingHuman 被挂起、从未真正跑过，
+// 批准之后必须在这里才第一次调用 registry.Invoke——不能把"已批准"
+// 这几个字当成工具结果喂给模型，模型会以为操作已经完成，
+// 但实际上文件可能根本没写。
+//
+// timeout <=0 时使用 DefaultToolTimeout。
+func ExecuteApproved(
+	ctx context.Context, registry *tool.Registry, timeout time.Duration,
+	callID, name, args string,
+) agent.ToolResult {
+	if timeout <= 0 {
+		timeout = DefaultToolTimeout
+	}
+	if registry == nil {
+		return agent.ToolResult{
+			CallID: callID, Name: name,
+			Output: "工具系统未启用", IsError: true,
+		}
+	}
+	if _, ok := registry.Get(name); !ok {
+		return agent.ToolResult{
+			CallID: callID, Name: name, IsError: true,
+			Output: fmt.Sprintf("工具 %q 不存在。可用工具：%s", name, strings.Join(registry.Names(), ", ")),
+		}
+	}
+	return runTool(ctx, registry, timeout, callID, name, args, time.Now())
 }
 
 // clearCheckpoint 清理本会话的 checkpoint（正常收尾时调用）。
@@ -476,54 +615,62 @@ func (l *Loop) saveRunningCheckpoint(ctx context.Context) {
 	}
 }
 
-// suspendAll 收集本轮所有交互型工具调用，写一条包含全部待回答项的 checkpoint。
+// suspendAll 收集本轮所有需要挂起的工具调用，写一条包含全部待处理项的 checkpoint。
+//
+// 两类都要挂起：
+//   - 交互型调用（ask_user）：人回答的文字就是 tool 结果；
+//   - 审批结果为 AwaitingHuman 的调用（人工审批模式下的写操作）：
+//     人的决定是"批准/拒绝"，批准后还要真正执行工具（见 ExecuteApproved），
+//     不能把"已批准"当成 tool 结果喂给模型。
 //
 // 返回 true 表示本轮已挂起，调用方应立刻返回（用**自己的** res，
 // 不能返回这里构造的对象——挂起是「本轮暂止」，不是「产出了结果」）。
 //
 // 与早期实现的关键差异：不再「遇到第一个就挂起」。同一轮里的多个
-// ask_user 必须一次性全部呈现给用户，否则后面的问题会静默消失——
-// 它们的 tool_calls 已经落库，却永远不会有人回答。
+// ask_user/待审批操作必须一次性全部呈现给用户，否则后面的问题会静默消失——
+// 它们的 tool_calls 已经落库，却永远不会有人回答/批准。
 func (l *Loop) suspendAll(
 	ctx context.Context,
 	calls []agent.ToolCall,
+	outcomes map[string]approvalOutcome,
 	out chan<- agent.Event,
 	step int,
 ) bool {
-	// 找出本轮所有交互型调用。
+	// 找出本轮所有需要挂起的调用。
 	var interactive []agent.ToolCall
+	var awaiting []agent.ToolCall
 	for _, call := range calls {
-		if l.cfg.Registry == nil {
-			break
+		if l.cfg.Registry != nil {
+			if t, ok := l.cfg.Registry.Get(call.Name); ok && t.Spec().Interactive {
+				interactive = append(interactive, call)
+				continue
+			}
 		}
-		t, ok := l.cfg.Registry.Get(call.Name)
-		if !ok {
-			continue
-		}
-		if t.Spec().Interactive {
-			interactive = append(interactive, call)
+		if outcomes[call.ID].decision == AwaitingHuman {
+			awaiting = append(awaiting, call)
 		}
 	}
-	if len(interactive) == 0 {
+	if len(interactive) == 0 && len(awaiting) == 0 {
 		return false
 	}
 
 	// ---- 安全分支：无法挂起时降级 ----
 	//
 	// 缺 sessionId 或没有存储时，不能假装挂起（用户永远等不到下文）。
-	// 退化为每个交互调用一条错误结果，让模型自己继续。
+	// 退化为每个待挂起调用一条错误结果，让模型自己继续。
 	reason := ""
 	switch {
 	case strings.TrimSpace(l.cfg.SessionID) == "":
-		reason = "当前会话未配置 ID，无法保存待回答的问题。请基于现有信息继续，" +
+		reason = "当前会话未配置 ID，无法保存待回答/待审批的内容。请基于现有信息继续，" +
 			"或直接在回答中说明需要用户补充什么。"
 	case l.cfg.Checkpointer == nil:
-		reason = "当前环境不支持保存待回答的问题。请基于现有信息继续，" +
+		reason = "当前环境不支持保存待回答/待审批的内容。请基于现有信息继续，" +
 			"或直接在回答中说明需要用户补充什么。"
 	}
 	if reason != "" {
-		slog.Warn("交互型工具被调用但无法挂起，降级为直接返回错误",
-			"count", len(interactive), "session_id", l.cfg.SessionID, "reason", reason)
+		slog.Warn("有调用需要挂起但无法挂起，降级为直接返回错误",
+			"interactive", len(interactive), "awaiting_approval", len(awaiting),
+			"session_id", l.cfg.SessionID, "reason", reason)
 		return false // 交给 executeOne 逐条产出错误结果
 	}
 
@@ -532,15 +679,13 @@ func (l *Loop) suspendAll(
 	//
 	// 注意：一个 ask_user 调用里可能含**多个**问题（questions 数组），
 	// 这里要把它们全部展开成独立的 Pending，否则用户只能看到第一个。
-	pendings := make([]session.Pending, 0, len(interactive))
+	pendings := make([]session.Pending, 0, len(interactive)+len(awaiting))
 	var invalid []agent.ToolCall
-	invalidCalls := make(map[string]bool, len(interactive))
 	for _, call := range interactive {
 		questions, err := tool.ParseAskUserQuestions(json.RawMessage(call.Args))
 		if err != nil {
 			slog.Warn("ask_user 参数不合法", "err", err, "call_id", call.ID)
 			invalid = append(invalid, call)
-			invalidCalls[call.ID] = true
 			continue
 		}
 		for _, q := range questions {
@@ -556,6 +701,20 @@ func (l *Loop) suspendAll(
 			})
 		}
 	}
+
+	// 待审批的写操作：没有"问题"的概念，Pending 里带的是工具名/参数/风险等级，
+	// 前端据此渲染"批准/拒绝"卡片而不是问答卡片（见 Pending.Kind）。
+	for _, call := range awaiting {
+		pendings = append(pendings, session.Pending{
+			Kind:   session.PendingApproval,
+			CallID: call.ID,
+			Name:   call.Name,
+			Args:   call.Args,
+			Risk:   call.Risk.String(),
+			Reason: outcomes[call.ID].reason,
+		})
+	}
+
 	// 全部非法：没有可挂起的内容，让 executeOne 逐条报错。
 	if len(pendings) == 0 {
 		return false
@@ -572,7 +731,7 @@ func (l *Loop) suspendAll(
 	}
 
 	// 落库用独立 ctx：runCtx 可能正在取消（用户点停止），
-	// 但 checkpoint 必须写成功，否则这些提问就彻底丢了。
+	// 但 checkpoint 必须写成功，否则这些提问/待批操作就彻底丢了。
 	saveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	if err := l.cfg.Checkpointer.SaveCheckpoint(saveCtx, cp); err != nil {
@@ -581,7 +740,7 @@ func (l *Loop) suspendAll(
 		return false
 	}
 
-	slog.Info("已挂起等待用户回答",
+	slog.Info("已挂起等待用户回答/审批",
 		"session_id", l.cfg.SessionID, "count", len(pendings),
 		"step", step, "invalid", len(invalid))
 

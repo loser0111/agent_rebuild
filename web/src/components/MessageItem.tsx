@@ -54,9 +54,11 @@ export function MessageItem({
   }
 
   const empty = !message.content
-  // 这一轮是否在等用户回答（ask_user 挂起）。
-  // 只认「当前挂起」这一条，历史里已答过的轮次不再提示。
+  // 这一轮是否在等用户处理（ask_user 回答 / 人工审批）。
+  // 只认「当前挂起」这一条，历史里已处理过的轮次不再提示。
   const awaiting = pendingQuestions.length > 0 && streaming
+  const awaitingApprovalOnly =
+    awaiting && pendingQuestions.every((q) => q.kind === 'approval')
 
   return (
     <div className="msg msg-assistant">
@@ -65,7 +67,7 @@ export function MessageItem({
         <span>Agent</span>
         {message.status === 'interrupted' && <span className="tag-warn">已中断</span>}
         {message.status === 'error' && <span className="tag-error">失败</span>}
-        {awaiting && <span className="tag-awaiting">等待回答</span>}
+        {awaiting && <span className="tag-awaiting">{awaitingApprovalOnly ? '等待审批' : '等待回答'}</span>}
         {streaming && !awaiting && <span className="tag-running">生成中</span>}
         {/* 工具调用折叠成一行摘要，挂在 Agent 标签右侧 */}
         {ownCalls.length > 0 && <ToolCallSummary calls={ownCalls} />}
@@ -73,7 +75,11 @@ export function MessageItem({
 
       <div className="msg-body">
         {empty && streaming && awaiting ? (
-          <div className="tool-pending">（已向用户提问，等待回答后继续）</div>
+          <div className="tool-pending">
+            {awaitingApprovalOnly
+              ? '（请求执行操作，等待你批准或拒绝）'
+              : '（已向用户提问，等待回答后继续）'}
+          </div>
         ) : empty && streaming ? (
           <div className="typing">
             <span />

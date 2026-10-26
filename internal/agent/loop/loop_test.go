@@ -351,11 +351,11 @@ func TestLoopUnknownTool(t *testing.T) {
 // denyAll 拒绝一切中高风险工具。
 type denyAll struct{}
 
-func (denyAll) Approve(_ context.Context, call agent.ToolCall) (bool, string) {
+func (denyAll) Approve(_ context.Context, call agent.ToolCall) (loop.ApprovalDecision, string) {
 	if call.Risk == tool.RiskSafe {
-		return true, ""
+		return loop.Approved, ""
 	}
-	return false, "测试拒绝"
+	return loop.Denied, "测试拒绝"
 }
 
 // 被拒绝的工具不应执行，但模型应收到「被拒绝」的反馈。
@@ -407,13 +407,13 @@ func TestAutoApproverDefaults(t *testing.T) {
 	a := loop.AutoApprover{AllowModerate: true, AllowDangerous: false}
 	ctx := context.Background()
 
-	if ok, _ := a.Approve(ctx, agent.ToolCall{Risk: tool.RiskSafe}); !ok {
+	if decision, _ := a.Approve(ctx, agent.ToolCall{Risk: tool.RiskSafe}); decision != loop.Approved {
 		t.Fatal("只读工具应放行")
 	}
-	if ok, _ := a.Approve(ctx, agent.ToolCall{Risk: tool.RiskModerate}); !ok {
+	if decision, _ := a.Approve(ctx, agent.ToolCall{Risk: tool.RiskModerate}); decision != loop.Approved {
 		t.Fatal("写文件应放行（AllowModerate=true）")
 	}
-	if ok, reason := a.Approve(ctx, agent.ToolCall{Risk: tool.RiskDangerous}); ok {
+	if decision, reason := a.Approve(ctx, agent.ToolCall{Risk: tool.RiskDangerous}); decision == loop.Approved {
 		t.Fatal("命令执行应被拒绝")
 	} else if reason == "" {
 		t.Fatal("拒绝应带理由")
@@ -421,8 +421,178 @@ func TestAutoApproverDefaults(t *testing.T) {
 
 	// 未开启 AllowModerate 时应拒绝写文件。
 	strict := loop.AutoApprover{}
-	if ok, _ := strict.Approve(ctx, agent.ToolCall{Risk: tool.RiskModerate}); ok {
+	if decision, _ := strict.Approve(ctx, agent.ToolCall{Risk: tool.RiskModerate}); decision == loop.Approved {
 		t.Fatal("严格模式下写文件应被拒绝")
+	}
+	// AutoApprover 永远能当场决定，不应返回 AwaitingHuman。
+	if decision, _ := strict.Approve(ctx, agent.ToolCall{Risk: tool.RiskDangerous}); decision == loop.AwaitingHuman {
+		t.Fatal("AutoApprover 不应返回 AwaitingHuman")
+	}
+}
+
+// ManualApprover 对任何需要审批的调用都应返回 AwaitingHuman，Safe 工具不在
+// 其职责范围内（evaluateApprovals 不会为 Safe 工具调用 Approve，见下方
+// TestLoopManualApprovalSuspendsWriteOperation 的分工说明）。
+func TestManualApproverAlwaysAwaits(t *testing.T) {
+	a := loop.ManualApprover{}
+	ctx := context.Background()
+
+	for _, risk := range []tool.Risk{tool.RiskModerate, tool.RiskDangerous} {
+		decision, reason := a.Approve(ctx, agent.ToolCall{Risk: risk})
+		if decision != loop.AwaitingHuman {
+			t.Fatalf("risk=%s: decision = %v，期望 AwaitingHuman", risk, decision)
+		}
+		if reason == "" {
+			t.Fatalf("risk=%s: 应带理由说明等待人工", risk)
+		}
+	}
+}
+
+// 人工审批模式下，写操作应挂起等待人工决定，而不是直接执行或拒绝。
+//
+// 关键断言：
+//  1. 文件确实没有被创建（挂起 ≠ 已执行、也 ≠ 已拒绝，是"还没决定"）；
+//  2. checkpoint 里的 Pending.Kind 是 PendingApproval（不是 PendingInput）；
+//  3. Risk/Reason 被正确带出，供前端渲染审批卡片。
+func TestLoopManualApprovalSuspendsWriteOperation(t *testing.T) {
+	root := t.TempDir()
+	reg := tool.DefaultRegistry(tool.Options{Workspace: root})
+	cp := &fakeCheckpointer{}
+
+	args, _ := json.Marshal(map[string]any{"path": "new.txt", "content": "x"})
+	runner := &scriptedRunner{steps: []scriptedStep{
+		{tools: []agent.ToolCall{{ID: "c1", Name: "write_file", Args: string(args)}}},
+	}}
+
+	lp := loop.New(runner, loop.Config{
+		Registry: reg, Approver: loop.ManualApprover{},
+		SessionID: "sess_manual", Checkpointer: cp,
+	})
+	res, _, err := runLoop(t, lp, userHistory("写个文件"))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	// 挂起时不应产出工具结果或最终回答。
+	if len(res.ToolResults) != 0 {
+		t.Fatalf("挂起时不应有工具结果: %+v", res.ToolResults)
+	}
+	if res.Content != "" {
+		t.Fatalf("挂起时不应有最终回答: %q", res.Content)
+	}
+
+	// 文件不应被创建：这是挂起而不是"静默放行"的关键证据。
+	if _, statErr := os.Stat(filepath.Join(root, "new.txt")); statErr == nil {
+		t.Fatal("挂起中的写操作不应产生副作用")
+	}
+
+	saved := cp.suspendedOf()
+	if saved == nil {
+		t.Fatal("应保存一条 suspended checkpoint")
+	}
+	if len(saved.Pendings) != 1 {
+		t.Fatalf("Pendings = %d，期望 1", len(saved.Pendings))
+	}
+	p := saved.Pendings[0]
+	if p.Kind != session.PendingApproval {
+		t.Fatalf("Kind = %q，期望 %q", p.Kind, session.PendingApproval)
+	}
+	if p.CallID != "c1" || p.Name != "write_file" {
+		t.Fatalf("CallID/Name 未正确带出: %+v", p)
+	}
+	if p.Risk != tool.RiskModerate.String() {
+		t.Fatalf("Risk = %q，期望 %q", p.Risk, tool.RiskModerate.String())
+	}
+	if p.Reason == "" {
+		t.Fatal("Reason 应带出 ManualApprover 给出的说明")
+	}
+}
+
+// 同一轮里既有 ask_user 又有待审批写操作时，必须合并进同一条 checkpoint，
+// 否则会出现"只挂起了一半"的半成品状态，另一半调用静默消失。
+func TestLoopManualApprovalMergesWithAskUser(t *testing.T) {
+	root := t.TempDir()
+	reg := tool.DefaultRegistry(tool.Options{Workspace: root})
+	cp := &fakeCheckpointer{}
+
+	writeArgs, _ := json.Marshal(map[string]any{"path": "new.txt", "content": "x"})
+	askArgs, _ := json.Marshal(map[string]any{"question": "这个值应该填多少？"})
+	runner := &scriptedRunner{steps: []scriptedStep{
+		{tools: []agent.ToolCall{
+			{ID: "c1", Name: "write_file", Args: string(writeArgs)},
+			{ID: "c2", Name: "ask_user", Args: string(askArgs)},
+		}},
+	}}
+
+	lp := loop.New(runner, loop.Config{
+		Registry: reg, Approver: loop.ManualApprover{},
+		SessionID: "sess_mixed", Checkpointer: cp,
+	})
+	if _, _, err := runLoop(t, lp, userHistory("你帮我处理一下")); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	saved := cp.suspendedOf()
+	if saved == nil {
+		t.Fatal("应保存一条 suspended checkpoint")
+	}
+	if len(saved.Pendings) != 2 {
+		t.Fatalf("Pendings = %d，期望 2（一个问题 + 一个待批操作）", len(saved.Pendings))
+	}
+	var gotApproval, gotInput bool
+	for _, p := range saved.Pendings {
+		switch p.Kind {
+		case session.PendingApproval:
+			gotApproval = true
+		case session.PendingInput:
+			gotInput = true
+		}
+	}
+	if !gotApproval || !gotInput {
+		t.Fatalf("两类挂起应同时存在: %+v", saved.Pendings)
+	}
+}
+
+// ---- ExecuteApproved：人工批准后才真正执行工具 ----
+
+// 批准后必须真正落盘，不能只是把"已批准"文字当结果喂给模型。
+func TestExecuteApprovedRunsTool(t *testing.T) {
+	root := t.TempDir()
+	reg := tool.DefaultRegistry(tool.Options{Workspace: root})
+	args, _ := json.Marshal(map[string]any{"path": "approved.txt", "content": "hello"})
+
+	res := loop.ExecuteApproved(context.Background(), reg, 5*time.Second, "c1", "write_file", string(args))
+	if res.IsError {
+		t.Fatalf("执行应成功: %s", res.Output)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "approved.txt"))
+	if err != nil {
+		t.Fatalf("文件应已写入: %v", err)
+	}
+	if string(data) != "hello" {
+		t.Fatalf("内容 = %q", string(data))
+	}
+}
+
+// 工具不存在时应给出明确错误，而不是 panic 或空结果。
+func TestExecuteApprovedUnknownTool(t *testing.T) {
+	root := t.TempDir()
+	reg := tool.DefaultRegistry(tool.Options{Workspace: root})
+
+	res := loop.ExecuteApproved(context.Background(), reg, 5*time.Second, "c1", "no_such_tool", "{}")
+	if !res.IsError {
+		t.Fatal("未知工具应报错")
+	}
+	if !strings.Contains(res.Output, "不存在") {
+		t.Fatalf("应说明工具不存在: %q", res.Output)
+	}
+}
+
+// registry 为 nil（工具系统未启用）时应安全返回错误，而不是 panic。
+func TestExecuteApprovedNilRegistry(t *testing.T) {
+	res := loop.ExecuteApproved(context.Background(), nil, 5*time.Second, "c1", "write_file", "{}")
+	if !res.IsError {
+		t.Fatal("registry 为 nil 时应报错")
 	}
 }
 

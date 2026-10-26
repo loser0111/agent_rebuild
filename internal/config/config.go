@@ -15,6 +15,40 @@ var ErrInvalidProvider = errors.New("配置错误")
 // ErrInvalidProtocol 表示 LLM_PROTOCOL 无法识别。
 var ErrInvalidProtocol = errors.New("配置错误")
 
+// ApprovalMode 决定工具调用（写文件/执行命令等需审批操作）由谁、怎么批准。
+//
+// 三档参考 Claude Code / Codex CLI 的权限模式设计，但收敛成产品侧更直观的
+// 三个选择（见 docs/12-approval-modes.md）：
+type ApprovalMode string
+
+const (
+	// ApprovalManual 一切需要审批的操作都挂起等人工在前端点击批准/拒绝。
+	// 最安全，也是未显式配置时的默认值——新功能默认选最保守的一档，
+	// 这是 Claude Code（default 模式）与 Codex CLI（Suggest 模式）的共同做法。
+	ApprovalManual ApprovalMode = "manual"
+	// ApprovalModel 由一次独立的模型调用（judge）当场裁决，不挂起、无需人工介入。
+	ApprovalModel ApprovalMode = "model"
+	// ApprovalAuto 完全自动：按 ENABLE_COMMAND_TOOL 决定命令执行开关，
+	// 其余一律放行，不做任何形式的审批。
+	ApprovalAuto ApprovalMode = "auto"
+)
+
+// normalizeApprovalMode 校验并归一化 APPROVAL_MODE 的取值。
+// 无法识别的值会被拒绝（快速失败），而不是静默回退到某个默认值——
+// 审批模式配错是安全相关的问题，不该被"拼写错误也能跑起来"掩盖。
+func normalizeApprovalMode(raw string) (ApprovalMode, error) {
+	switch ApprovalMode(strings.ToLower(strings.TrimSpace(raw))) {
+	case ApprovalManual:
+		return ApprovalManual, nil
+	case ApprovalModel:
+		return ApprovalModel, nil
+	case ApprovalAuto:
+		return ApprovalAuto, nil
+	default:
+		return "", fmt.Errorf("APPROVAL_MODE=%q 无法识别，可选值：manual | model | auto", raw)
+	}
+}
+
 // Config 汇总全部运行时配置，全部来自环境变量（12-factor）。
 // 默认值保证「零配置即可启动 Demo」：LLM_PROVIDER=mock。
 type Config struct {
@@ -59,6 +93,11 @@ type Config struct {
 	EnableCommandTool bool          // ENABLE_COMMAND_TOOL；是否启用命令执行（危险，默认关）
 	MaxToolSteps      int           // MAX_TOOL_STEPS；单次对话最多几轮工具调用
 	ToolTimeout       time.Duration // TOOL_TIMEOUT；单个工具执行超时
+
+	// 审批
+	ApprovalMode  ApprovalMode  // APPROVAL_MODE：manual | model | auto，默认 manual
+	JudgeTimeout  time.Duration // JUDGE_TIMEOUT；model 模式下单次裁决超时
+	JudgeFailOpen bool          // JUDGE_FAIL_OPEN；model 模式下 judge 调用失败时是否放行，默认 false（拒绝）
 }
 
 // Load 读取环境变量并校验。校验失败立即返回错误（快速失败）。
@@ -89,7 +128,18 @@ func Load() (*Config, error) {
 		EnableCommandTool: envBool("ENABLE_COMMAND_TOOL", true), // 默认支持系统配置路径，
 		MaxToolSteps:      envInt("MAX_TOOL_STEPS", 200),
 		ToolTimeout:       envDuration("TOOL_TIMEOUT", 120*time.Second),
+
+		JudgeTimeout:  envDuration("JUDGE_TIMEOUT", 10*time.Second),
+		JudgeFailOpen: envBool("JUDGE_FAIL_OPEN", false),
 	}
+
+	// 审批模式单独解析校验：配错值要快速失败，而不是静默退到某个默认值
+	// （审批模式是安全相关的开关，拼写错误不该被悄悄吞掉）。
+	approvalMode, err := normalizeApprovalMode(envString("APPROVAL_MODE", string(ApprovalManual)))
+	if err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
+	c.ApprovalMode = approvalMode
 
 	// 解析 provider 别名，套用内置预设（BaseURL / 默认模型）。
 	// 用户显式给出的 LLM_BASE_URL / LLM_MODEL 始终优先，便于接自定义网关。

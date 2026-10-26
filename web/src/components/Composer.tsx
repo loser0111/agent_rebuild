@@ -3,6 +3,7 @@ import { useChat } from '../state/chatStore'
 import { useModels } from '../state/modelsStore'
 import { ModelPicker } from './ModelPicker'
 import { AskUserCard } from './AskUserCard'
+import { ApprovalCard } from './ApprovalCard'
 
 interface ComposerProps {
   onOpenModelManager: () => void
@@ -17,6 +18,10 @@ interface ComposerProps {
  * 为什么这样做：挂起时把输入框整个禁用、逼用户去卡片里的小输入区打字，
  * 是很别扭的——用户看到问题后第一反应就是在最显眼的输入框里回答。
  * 而且一次只能答一个问题时，多个问题要来回点，体验很差。
+ *
+ * 待审批的操作（kind='approval'）走不同的路径：它没有"答案文字"，
+ * 只能在 ApprovalCard 里点批准/拒绝，主输入框在这类挂起下只负责
+ * 阻塞新消息、提示用户去卡片里处理，不参与答题逻辑。
  */
 export function Composer({ onOpenModelManager }: ComposerProps) {
   const {
@@ -37,8 +42,16 @@ export function Composer({ onOpenModelManager }: ComposerProps) {
   const [value, setValue] = useState('')
   const taRef = useRef<HTMLTextAreaElement>(null)
 
+  // 只有 ask_user 问答走"输入框答题"这条路径；审批操作走 ApprovalCard。
+  const answerQuestions = useMemo(
+    () => pendingQuestions.filter((q) => q.kind === 'input'),
+    [pendingQuestions],
+  )
+  const hasApprovalOnly =
+    pendingQuestions.length > 0 && answerQuestions.length === 0
+
   // 有挂起提问时，输入框进入「答题模式」。
-  const awaitingAnswer = pendingQuestions.length > 0
+  const awaitingAnswer = answerQuestions.length > 0
 
   /**
    * 当前要回答的问题是「第一个还没答的」。
@@ -51,14 +64,15 @@ export function Composer({ onOpenModelManager }: ComposerProps) {
    */
   const activeQuestion = useMemo(() => {
     if (!awaitingAnswer) return null
-    return pendingQuestions.find((q) => (draftAnswers[q.key] ?? '').trim() === '') ?? null
-  }, [awaitingAnswer, pendingQuestions, draftAnswers])
+    return answerQuestions.find((q) => (draftAnswers[q.key] ?? '').trim() === '') ?? null
+  }, [awaitingAnswer, answerQuestions, draftAnswers])
 
   const allAnswered =
-    awaitingAnswer && pendingQuestions.every((q) => (draftAnswers[q.key] ?? '').trim() !== '')
+    awaitingAnswer && answerQuestions.every((q) => (draftAnswers[q.key] ?? '').trim() !== '')
 
-  // 生成中禁用；等待回答时**不禁用**（否则没法答题）。
-  const disabled = !currentId || isStreaming
+  // 生成中禁用；等待回答时**不禁用**（否则没法答题）；
+  // 只有待审批操作时也禁用——这类挂起只能靠 ApprovalCard 的按钮处理。
+  const disabled = !currentId || isStreaming || hasApprovalOnly
   const canSend = awaitingAnswer
     ? allAnswered || value.trim().length > 0
     : value.trim().length > 0 && !disabled
@@ -77,7 +91,7 @@ export function Composer({ onOpenModelManager }: ComposerProps) {
   }, [currentId])
 
   // 问题集合变化时清空输入，避免上一题的残留串到下一题。
-  const signature = pendingQuestions.map((q) => q.key).join(',')
+  const signature = answerQuestions.map((q) => q.key).join(',')
   useEffect(() => {
     setValue('')
   }, [signature])
@@ -98,7 +112,7 @@ export function Composer({ onOpenModelManager }: ComposerProps) {
         setDraftAnswer(activeQuestion.key, text)
       }
 
-      const stillMissing = pendingQuestions.some((q) => (merged[q.key] ?? '').trim() === '')
+      const stillMissing = answerQuestions.some((q) => (merged[q.key] ?? '').trim() === '')
       if (stillMissing) {
         // 还有问题没答：只记下这一条，把输入框清空准备答下一题。
         setValue('')
@@ -107,15 +121,16 @@ export function Composer({ onOpenModelManager }: ComposerProps) {
 
       // 全部答完 → 一次性提交。
       const payload: Record<string, string> = {}
-      for (const q of pendingQuestions) {
+      for (const q of answerQuestions) {
         payload[q.key] = (merged[q.key] ?? '').trim()
       }
       setValue('')
       resetDrafts()
-      await resume(payload)
+      await resume({ answers: payload })
       return
     }
 
+    if (disabled) return
     const text = value.trim()
     if (!text) return
     setValue('')
@@ -130,8 +145,8 @@ export function Composer({ onOpenModelManager }: ComposerProps) {
     }
   }
 
-  const total = pendingQuestions.length
-  const remaining = pendingQuestions.filter((q) => (draftAnswers[q.key] ?? '').trim() === '').length
+  const total = answerQuestions.length
+  const remaining = answerQuestions.filter((q) => (draftAnswers[q.key] ?? '').trim() === '').length
   const placeholder = !currentId
     ? '请先在左侧选择或新建会话'
     : awaitingAnswer
@@ -140,12 +155,15 @@ export function Composer({ onOpenModelManager }: ComposerProps) {
           ? `回答第 ${total - remaining + 1} 个问题（共 ${total} 个），Enter 记录`
           : '输入你的回答，Enter 提交'
         : '还有问题未回答，请在上方卡片中补充'
-      : '输入消息，Enter 发送，Shift+Enter 换行…'
+      : hasApprovalOnly
+        ? '请在上方卡片中批准或拒绝该操作'
+        : '输入消息，Enter 发送，Shift+Enter 换行…'
 
   return (
     <div className="composer" data-no-window-drag>
-      {/* 有提问时，问题卡片顶在输入框上方 */}
+      {/* 有提问/待审批操作时，卡片顶在输入框上方 */}
       <AskUserCard />
+      <ApprovalCard />
 
       <div className={`composer-box${disabled ? ' is-disabled' : ''}`}>
         <textarea
@@ -181,7 +199,9 @@ export function Composer({ onOpenModelManager }: ComposerProps) {
                   ? allAnswered
                     ? 'Enter 提交全部答案'
                     : `逐题回答，还剩 ${remaining} 个`
-                  : `${value.length} 字`}
+                  : hasApprovalOnly
+                    ? '等待审批决定'
+                    : `${value.length} 字`}
             </span>
           </div>
 
