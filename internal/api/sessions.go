@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"agent_rebuild/internal/config"
 	"agent_rebuild/internal/modelconfig"
 	"agent_rebuild/internal/session"
 )
@@ -24,6 +25,10 @@ type createSessionRequest struct {
 	Title        string `json:"title"`
 	Model        string `json:"model"`
 	SystemPrompt string `json:"system_prompt"`
+	// WorkspaceID 创建时预设绑定的 workspace；为空表示不绑定。
+	WorkspaceID string `json:"workspace_id"`
+	// ApprovalMode 创建时预设的会话级审批模式覆盖；为空表示跟随全局。
+	ApprovalMode string `json:"approval_mode"`
 }
 
 type createSessionResponse struct {
@@ -46,6 +51,10 @@ type patchSessionRequest struct {
 	Model *string `json:"model"`
 	// ModelConfigID 切换会话使用的模型配置；传空串表示回退到全局默认。
 	ModelConfigID *string `json:"model_config_id"`
+	// WorkspaceID 切换会话绑定的 workspace；传空串表示解绑。
+	WorkspaceID *string `json:"workspace_id"`
+	// ApprovalMode 切换会话级审批模式覆盖；传空串表示回退到跟随全局。
+	ApprovalMode *string `json:"approval_mode"`
 }
 
 // ---- handlers ----
@@ -63,13 +72,45 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		model = s.cfg.LLMModel
 	}
+
+	// workspace_id 预设：非空时先校验存在，否则会话会指向一个查不到的
+	// workspace，直到真正要用它做路径权限判断时才报错（目前权限还没接入，
+	// 但语义上提前校验能避免用户传错 ID 却毫无感知）。
+	workspaceID := strings.TrimSpace(req.WorkspaceID)
+	if workspaceID != "" {
+		if s.workspaces == nil {
+			respondError(w, r, http.StatusNotImplemented, CodeInternal,
+				"当前存储驱动不支持 workspace（需要 STORE_DRIVER=sqlite）")
+			return
+		}
+		if _, err := s.workspaces.Get(r.Context(), workspaceID); err != nil {
+			s.respondWorkspaceError(w, r, err)
+			return
+		}
+	}
+
+	// approval_mode 预设：非空时校验取值合法，并归一化成标准形式
+	// （与 PUT /api/approval-mode 用的是同一个校验函数）。
+	approvalMode := strings.TrimSpace(req.ApprovalMode)
+	if approvalMode != "" {
+		normalized, err := config.NormalizeApprovalMode(approvalMode)
+		if err != nil {
+			respondError(w, r, http.StatusBadRequest, CodeInvalidArgument, err.Error())
+			return
+		}
+		approvalMode = string(normalized)
+	}
+
 	sess := session.NewSessionAt(req.Title, model, time.Now().UTC())
+	sess.WorkspaceID = workspaceID
+	sess.ApprovalMode = approvalMode
 
 	if err := s.store.Create(r.Context(), sess); err != nil {
 		s.respondStoreError(w, r, err)
 		return
 	}
-	slog.InfoContext(r.Context(), "会话已创建", "session_id", sess.ID, "model", sess.Model)
+	slog.InfoContext(r.Context(), "会话已创建", "session_id", sess.ID, "model", sess.Model,
+		"workspace_id", sess.WorkspaceID, "approval_mode", sess.ApprovalMode)
 	respondJSON(w, r, http.StatusCreated, createSessionResponse{Session: sess})
 }
 
@@ -128,7 +169,7 @@ func (s *Server) handleGetSession(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handlePatchSession 局部更新（当前支持标题与模型）。
+// handlePatchSession 局部更新（当前支持标题、模型、workspace、审批模式）。
 func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
@@ -137,9 +178,10 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		respondError(w, r, http.StatusBadRequest, CodeInvalidArgument, err.Error())
 		return
 	}
-	if req.Title == nil && req.Model == nil && req.ModelConfigID == nil {
+	if req.Title == nil && req.Model == nil && req.ModelConfigID == nil &&
+		req.WorkspaceID == nil && req.ApprovalMode == nil {
 		respondError(w, r, http.StatusBadRequest, CodeInvalidArgument,
-			"至少需要提供 title、model 或 model_config_id")
+			"至少需要提供 title、model、model_config_id、workspace_id 或 approval_mode")
 		return
 	}
 
@@ -161,6 +203,32 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 切换 workspace 前先确认它存在，理由同模型配置：避免会话指向一个
+	// 查不到的 workspace 却毫无感知。传空串表示解绑，不需要校验。
+	if req.WorkspaceID != nil && strings.TrimSpace(*req.WorkspaceID) != "" {
+		if s.workspaces == nil {
+			respondError(w, r, http.StatusNotImplemented, CodeInternal,
+				"当前存储驱动不支持 workspace（需要 STORE_DRIVER=sqlite）")
+			return
+		}
+		if _, err := s.workspaces.Get(r.Context(), strings.TrimSpace(*req.WorkspaceID)); err != nil {
+			s.respondWorkspaceError(w, r, err)
+			return
+		}
+	}
+
+	// 审批模式取值校验 + 归一化（与创建会话、PUT /api/approval-mode 用
+	// 同一个校验函数）。传空串表示回退到跟随全局，不需要校验。
+	var normalizedApprovalMode string
+	if req.ApprovalMode != nil && strings.TrimSpace(*req.ApprovalMode) != "" {
+		normalized, err := config.NormalizeApprovalMode(*req.ApprovalMode)
+		if err != nil {
+			respondError(w, r, http.StatusBadRequest, CodeInvalidArgument, err.Error())
+			return
+		}
+		normalizedApprovalMode = string(normalized)
+	}
+
 	updated, err := s.store.Update(r.Context(), id, func(sc *session.Session) error {
 		if req.Title != nil {
 			if len([]rune(*req.Title)) > 200 {
@@ -173,6 +241,12 @@ func (s *Server) handlePatchSession(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.ModelConfigID != nil {
 			sc.ModelConfigID = strings.TrimSpace(*req.ModelConfigID)
+		}
+		if req.WorkspaceID != nil {
+			sc.WorkspaceID = strings.TrimSpace(*req.WorkspaceID)
+		}
+		if req.ApprovalMode != nil {
+			sc.ApprovalMode = normalizedApprovalMode
 		}
 		return nil
 	})

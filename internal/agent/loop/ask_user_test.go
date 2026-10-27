@@ -164,34 +164,111 @@ func TestAskUserSuspendsAndSavesSessionID(t *testing.T) {
 	}
 }
 
-// 挂起后必须立刻停止，不能继续执行同一个 assistant 消息里的后续调用。
-func TestAskUserStopsFollowingCalls(t *testing.T) {
+// 混合批次：挂起不应连带"腰斩"同轮里其它不需要挂起的安全调用。
+//
+// 背景（真实 bug，见 loop.go Run() 里"把本轮调用分成立即执行与需要
+// 挂起两类"那段注释）：早期实现只要同轮有一个需要挂起的调用（如
+// ask_user），就会在执行任何工具之前直接挂起返回，导致 list_dir 这类
+// 安全只读调用的 tool_call 事件已经发给前端（显示"调用中"），却永远
+// 没有配对的工具结果——用户回答/批准了 ask_user 之后，list_dir 依然
+// 卡死，历史里留下一条没有结果的 tool_calls。
+//
+// 现在的预期行为：list_dir（Safe，不需要审批）应该照常执行并产出
+// 结果；只有 ask_user 本身挂起，且挂起的 checkpoint 里只包含它。
+func TestAskUserDoesNotBlockSafeCallsInSameBatch(t *testing.T) {
 	cp := &fakeCheckpointer{}
 	runner := &scriptedRunner{steps: []scriptedStep{{
 		tools: []agent.ToolCall{
 			askUserCall("call_ask", `{"question":"继续吗？"}`),
-			// 这一条在挂起后不应被执行。
+			// 同一轮里的安全只读调用：现在应该正常执行，不再被"连坐"挂起。
 			{ID: "call_ls", Name: "list_dir", Args: `{"path":"."}`},
 		},
 	}}}
 
 	lp := newAskLoop(runner, cp, "sess_stop")
 	out := make(chan agent.Event, 64)
-	if _, err := lp.Run(context.Background(), nil, out); err != nil {
+	res, err := lp.Run(context.Background(), nil, out)
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	close(out)
 
-	if len(lp.Suspended().Pendings[0].Options) != 0 {
-		t.Log("options 应为空（自由输入）")
+	// list_dir 必须产出工具结果，不能因为同轮有 ask_user 而被跳过。
+	var lsResult *agent.ToolResult
+	for i := range res.ToolResults {
+		if res.ToolResults[i].CallID == "call_ls" {
+			lsResult = &res.ToolResults[i]
+		}
 	}
+	if lsResult == nil {
+		t.Fatalf("list_dir（同轮的安全调用）应该被执行，实际没有产出任何结果：%+v", res.ToolResults)
+	}
+	if lsResult.IsError {
+		t.Fatalf("list_dir 应执行成功，实际: %s", lsResult.Output)
+	}
+
+	// ask_user 本身仍应正常挂起，且挂起项里不应混进已经执行过的 call_ls。
+	if lp.Suspended() == nil {
+		t.Fatal("ask_user 应挂起")
+	}
+	saved := cp.suspendedOf()
+	if saved == nil {
+		t.Fatal("应保存一条 suspended checkpoint")
+	}
+	if len(saved.Pendings) != 1 || saved.Pendings[0].CallID != "call_ask" {
+		t.Fatalf("suspended checkpoint 应只包含 call_ask 这一条待回答项，实际: %+v", saved.Pendings)
+	}
+
+	// Completed 应忠实记录已执行的 call_ls——即使当前没有任何代码读取它
+	// 做跳过判断（纯写入，为将来接幂等重放留数据），这里也要保证记录正确，
+	// 不能因为挂起了就把已经跑完的调用漏记。
+	if len(saved.Completed) != 1 || saved.Completed[0] != "call_ls" {
+		t.Fatalf("Completed = %v，期望 [call_ls]", saved.Completed)
+	}
+}
+
+// 纯交互批次（同轮没有混入任何安全调用）：保留原有意图——挂起前不应
+// 执行任何工具，checkpoint 只写两次（running + suspended）。
+//
+// 这条测试原名 TestAskUserStopsFollowingCalls，断言过"挂起后不执行
+// 同轮任何后续调用"；修复 list_dir/run_command 混合批次卡死的 bug 后
+// （见 TestAskUserDoesNotBlockSafeCallsInSameBatch），这个原始断言在
+// "全是需要挂起的调用"这个子场景下依然成立，只是不再适用于混合批次，
+// 所以拆成单独一条测试，而不是直接删掉。
+func TestAskUserStopsFollowingCallsWhenAllNeedSuspension(t *testing.T) {
+	cp := &fakeCheckpointer{}
+	runner := &scriptedRunner{steps: []scriptedStep{{
+		tools: []agent.ToolCall{
+			askUserCall("call_ask1", `{"question":"继续吗？"}`),
+			// 同样是需要挂起的交互调用，不是安全调用——两者都不该被执行。
+			askUserCall("call_ask2", `{"question":"还要确认什么？"}`),
+		},
+	}}}
+
+	lp := newAskLoop(runner, cp, "sess_stop_all")
+	out := make(chan agent.Event, 64)
+	res, err := lp.Run(context.Background(), nil, out)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	close(out)
+
+	if len(res.ToolResults) != 0 {
+		t.Fatalf("全部挂起时不应产出任何工具结果，实际: %+v", res.ToolResults)
+	}
+
 	cp.mu.Lock()
 	savedCount := len(cp.saved)
 	cp.mu.Unlock()
 	// 只有两次写入：running（开始时）+ suspended（挂起时）。
-	// 若后续调用被执行，会多出执行痕迹。
+	// 若有调用被执行，会多出执行痕迹（本场景下不该有）。
 	if savedCount != 2 {
 		t.Fatalf("checkpoint 写入次数 = %d，期望 2（running + suspended）", savedCount)
+	}
+
+	saved := cp.suspendedOf()
+	if saved == nil || len(saved.Pendings) != 2 {
+		t.Fatalf("应有一条包含两个待回答项的 suspended checkpoint，实际: %+v", saved)
 	}
 }
 

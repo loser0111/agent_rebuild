@@ -32,6 +32,10 @@ export interface Session {
   model: string
   /** 该会话选用的模型配置 id（空表示用全局默认） */
   model_config_id?: string
+  /** 该会话绑定的 workspace id（空表示未绑定，见 docs/14-workspace-and-session-presets.md） */
+  workspace_id?: string
+  /** 该会话的审批模式覆盖（空表示跟随全局 /api/approval-mode 的当前值） */
+  approval_mode?: ApprovalMode | ''
   meta?: Record<string, string>
 }
 
@@ -81,6 +85,25 @@ export interface TestModelConfigResponse {
   /** 测试成功时返回的首段输出，便于确认模型真的能回话 */
   preview?: string
   latency_ms?: number
+}
+
+/* ---- workspace（会话可绑定的多文件夹集合，见 docs/14-workspace-and-session-presets.md） ---- */
+
+export interface Workspace {
+  id: string
+  name: string
+  folders: string[]
+  created_at: string
+  updated_at: string
+}
+
+export interface WorkspaceInput {
+  name: string
+  folders: string[]
+}
+
+export interface WorkspaceListResponse {
+  workspaces: Workspace[]
 }
 
 /** 后端返回的工具调用记录（落库形态）。 */

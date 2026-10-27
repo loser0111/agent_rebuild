@@ -51,6 +51,16 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("POST /api/models", s.handleCreateModelConfig)
 	mux.HandleFunc("/api/models", methodNotAllowed("GET, POST"))
 
+	// workspace（会话可绑定的多文件夹集合；需要 STORE_DRIVER=sqlite，
+	// 见 docs/14-workspace-and-session-presets.md）
+	mux.HandleFunc("GET /api/workspaces", s.handleListWorkspaces)
+	mux.HandleFunc("POST /api/workspaces", s.handleCreateWorkspace)
+	mux.HandleFunc("/api/workspaces", methodNotAllowed("GET, POST"))
+
+	mux.HandleFunc("PUT /api/workspaces/{id}", s.handleUpdateWorkspace)
+	mux.HandleFunc("DELETE /api/workspaces/{id}", s.handleDeleteWorkspace)
+	mux.HandleFunc("/api/workspaces/{id}", methodNotAllowed("PUT, DELETE"))
+
 	// 工具列表（供前端展示与调试）
 	mux.HandleFunc("GET /api/tools", s.handleListTools)
 	mux.HandleFunc("/api/tools", methodNotAllowed("GET"))

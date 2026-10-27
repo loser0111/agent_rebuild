@@ -196,3 +196,62 @@ export function rebuildToolCalls(
 
   return out
 }
+
+/**
+ * 把一段工具参数 JSON 归一化成可比较的字符串：解析成功就按 key 排序后
+ * 重新 stringify（抹掉模型输出里常见的空格/换行/键顺序差异），解析失败
+ * （模型偶尔产出不完整 JSON）就退回 trim 后的原文本比较，而不是直接报错。
+ *
+ * 用途见 findDuplicateExecutedCall：判断两次工具调用"参数是否相同"。
+ */
+export function canonicalToolArgs(raw: string | undefined): string {
+  const text = (raw ?? '').trim()
+  if (!text) return ''
+  try {
+    const parsed = JSON.parse(text)
+    return JSON.stringify(sortKeysDeep(parsed))
+  } catch {
+    return text
+  }
+}
+
+/** 递归按 key 排序对象（数组保持原顺序，只对对象的 key 排序），供 canonicalToolArgs 使用。 */
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep)
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of entries) out[k] = sortKeysDeep(v)
+    return out
+  }
+  return value
+}
+
+/**
+ * 在已知工具调用里找一条"同名同参数、但不是自己"的调用，用于在审批卡片上
+ * 提示"这个操作之前已经执行过一次"（真实场景：小模型有时会在挂起→resume
+ * 之后的下一回合里，没意识到已经执行过就把同样的命令又发一次）。
+ *
+ * 只是提示，不做任何拦截——仍然由用户自己决定批准/拒绝，这里不替用户
+ * 做判断（参数相同不代表这次重复执行就一定是错的，比如用户确实想
+ * 再跑一次同样的命令）。优先返回已成功执行的那条，让提示更有参考价值；
+ * 找不到成功的就退回第一条匹配（哪怕是失败/被拒绝过的）。
+ */
+export function findDuplicateExecutedCall(
+  toolName: string | undefined,
+  toolArgs: string | undefined,
+  excludeCallId: string,
+  calls: Record<string, ToolCallView>,
+): ToolCallView | undefined {
+  if (!toolName) return undefined
+  const canon = canonicalToolArgs(toolArgs)
+  let fallback: ToolCallView | undefined
+  for (const c of Object.values(calls)) {
+    if (c.call_id === excludeCallId) continue
+    if (c.name !== toolName) continue
+    if (canonicalToolArgs(c.args) !== canon) continue
+    if (c.status === 'success') return c
+    if (!fallback) fallback = c
+  }
+  return fallback
+}

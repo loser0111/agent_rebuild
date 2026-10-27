@@ -24,6 +24,7 @@ import (
 	"agent_rebuild/internal/session"
 	"agent_rebuild/internal/storage/sqlite"
 	"agent_rebuild/internal/tool"
+	"agent_rebuild/internal/workspace"
 )
 
 func main() {
@@ -61,7 +62,7 @@ func run() error {
 		}
 	}
 
-	store, checkpoints, runner, models, closer, err := buildDataLayer(cfg)
+	store, checkpoints, runner, models, workspaces, closer, err := buildDataLayer(cfg)
 	if err != nil {
 		return err
 	}
@@ -102,6 +103,10 @@ func run() error {
 		srv.SetModelConfigStore(models, func(mc *modelconfig.Config) (agent.Runner, error) {
 			return buildRunnerFromModelConfig(cfg, mc)
 		})
+	}
+	// 注入 workspace 存储（支持会话绑定多文件夹，见 docs/14-workspace-and-session-presets.md）。
+	if workspaces != nil {
+		srv.SetWorkspaceStore(workspaces)
 	}
 
 	// 单端口部署：托管前端静态产物（存在时才启用）。
@@ -182,46 +187,49 @@ func run() error {
 //
 // 返回值 closer 用于在进程退出时释放资源（关闭数据库）。
 // 忘记调用它会丢数据：SQLite 的 WAL 需要 checkpoint 才能合并到主库。
-func buildDataLayer(cfg *config.Config) (session.Store, session.CheckpointStore, agent.Runner, modelconfig.Store, func() error, error) {
+func buildDataLayer(cfg *config.Config) (session.Store, session.CheckpointStore, agent.Runner, modelconfig.Store, workspace.Store, func() error, error) {
 	switch cfg.StoreDriver {
 	case "memory", "":
-		// 内存模式：不支持持久化模型配置，退化为环境变量配置。
+		// 内存模式：不支持持久化模型配置、workspace，退化为环境变量配置
+		// （会话绑定 workspace 的功能在这种驱动下不可用，见 Server.requireWorkspaces）。
 		runner, err := buildRunnerFromConfig(cfg)
 		if err != nil {
-			return nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, err
 		}
-		slog.Warn("使用内存存储：重启后会话与模型配置都会丢失")
+		slog.Warn("使用内存存储：重启后会话、模型配置与 workspace 都会丢失")
 		// 内存模式没有 checkpoint：进程重启即丢，断点无从恢复，
 		// 返回 nil 让 ask_user 走「无法提问」的降级分支。
-		return session.NewMemoryStore(cfg.MaxMessagesPerSession), nil, runner, nil, nil, nil
+		return session.NewMemoryStore(cfg.MaxMessagesPerSession), nil, runner, nil, nil, nil, nil
 
 	case "sqlite":
 		dataDir, err := config.ResolveDataDir(cfg.DataDir)
 		if err != nil {
-			return nil, nil, nil, nil, nil, fmt.Errorf("解析数据目录失败: %w", err)
+			return nil, nil, nil, nil, nil, nil, fmt.Errorf("解析数据目录失败: %w", err)
 		}
 		dbPath := config.DBPath(dataDir)
 		db, err := sqlite.Open(dbPath)
 		if err != nil {
-			return nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, err
 		}
 		slog.Info("SQLite 已就绪", "path", dbPath, "data_dir", dataDir)
 
 		// 加密密钥派生自数据目录绝对路径：
 		// 数据库被拷到其他机器/其他用户目录后无法解密 API Key。
 		models := modelconfig.NewSQLStore(db.SQL(), dataDir)
+		// workspace 不涉及密钥，直接复用同一个 *sql.DB。
+		workspaces := workspace.NewSQLStore(db.SQL())
 
 		runner, err := resolveRunner(cfg, models)
 		if err != nil {
 			_ = db.Close()
-			return nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, err
 		}
 		return sqlite.NewSessionStore(db, cfg.MaxMessagesPerSession),
 			sqlite.NewCheckpointStore(db),
-			runner, models, db.Close, nil
+			runner, models, workspaces, db.Close, nil
 
 	default:
-		return nil, nil, nil, nil, nil, fmt.Errorf(
+		return nil, nil, nil, nil, nil, nil, fmt.Errorf(
 			"不支持的 STORE_DRIVER=%q（可选 memory / sqlite）", cfg.StoreDriver)
 	}
 }

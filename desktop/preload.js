@@ -2,9 +2,10 @@
  * 预加载脚本。
  *
  * 界面通过 HTTP/SSE 与后端通信，绝大多数能力不需要主进程。
- * 这里只暴露两类最小接口：
+ * 这里只暴露三类最小接口：
  *   1. desktopEnv —— 只读的环境标识
  *   2. windowControl —— 窗口缩放（隐藏标题栏后需自行实现双击放大）
+ *   3. fileDialog —— 原生文件夹选择器（workspace 管理用，渲染层拿不到真实路径）
  *
  * contextIsolation=true + sandbox=true 下，渲染进程无法访问 Node API，
  * 只能通过这里显式暴露的方法与主进程通信。
@@ -30,4 +31,12 @@ contextBridge.exposeInMainWorld('windowControl', {
   toggleMaximize: () => ipcRenderer.invoke('window:toggle-maximize'),
   /** 查询当前是否最大化（用于图标/提示状态）。 */
   isMaximized: () => ipcRenderer.invoke('window:is-maximized'),
+})
+
+contextBridge.exposeInMainWorld('fileDialog', {
+  /**
+   * 弹出系统原生的文件夹选择器，返回选中的绝对路径数组。
+   * 用户取消选择时返回空数组（不是 null），调用方可以直接当数组用。
+   */
+  selectFolders: (options) => ipcRenderer.invoke('dialog:select-folders', options ?? {}),
 })

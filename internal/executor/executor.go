@@ -60,6 +60,15 @@ type Request struct {
 	// 为空时使用全局默认配置。这是「会话级/请求级选模型」的入口：
 	// 同一会话可以本次用 A 模型、下次用 B 模型，无需重启。
 	ModelConfigID string
+	// ApprovalMode 会话记录的审批模式覆盖（manual/model/auto 的裸字符串）。
+	//
+	// 为空时使用 e.approver（进程级全局审批模式，可被 Server.SetApprovalMode
+	// 运行时热切换）；非空时固定用这个会话自己的模式，不随全局开关的后续
+	// 变化而改变——这正是"会话级预设、重新打开不会被全局设置覆盖"的入口。
+	// 解析失败（如 approverResolver 未注入、取值非法）会记日志回退全局默认，
+	// 不会让整次执行失败：审批模式解析失败属于"降级到更保守的默认行为"，
+	// 不应该阻塞用户的正常对话。
+	ApprovalMode string
 	// RunTimeout 单次执行总时限；<=0 使用默认值。
 	RunTimeout time.Duration
 }
@@ -73,6 +82,17 @@ type Request struct {
 // 返回的 Runner 由调用方使用，不要求幂等（每次执行都会重新解析，
 // 保证用户改了密钥后立即生效）。
 type RunnerResolver func(modelConfigID string) (agent.Runner, error)
+
+// ApproverResolver 按会话记录的审批模式字符串解析出对应的 Approver。
+//
+// 与 RunnerResolver 是完全同构的设计：都是"会话存一个裸值（字符串 ID /
+// 模式名），执行时现场解析成真正要用的对象"，而不是让 Executor 自己
+// 知道 manual/model/auto 分别对应哪个实现（那是 Server.buildApprover
+// 已经有的逻辑，不应该在 executor 包重复一份）。
+//
+// 返回错误时调用方（streamEvents）应回退到 e.approver（全局默认），
+// 不应让整次执行失败——见 Request.ApprovalMode 的注释。
+type ApproverResolver func(mode string) (loop.Approver, error)
 
 // Status 任务状态。
 type Status string
@@ -167,6 +187,9 @@ type Executor struct {
 	runnerFn func() agent.Runner
 	// resolver 按模型配置 ID 构造 Runner（nil 表示不支持多模型选择）。
 	resolver RunnerResolver
+	// approverResolver 按会话记录的审批模式字符串构造 Approver
+	// （nil 表示不支持会话级覆盖，所有执行都用 e.approver）。
+	approverResolver ApproverResolver
 
 	// 工具系统（nil 表示不启用）。
 	registry     *tool.Registry
@@ -333,7 +356,7 @@ func (e *Executor) SetCheckpointer(cp session.CheckpointStore) {
 	e.checkpointer = cp
 }
 
-// SetApprover 运行时热替换审批策略，不影响已注册的工具/系统提示/步数限制。
+// SetApprover 运行时热替换审批策略（全局默认），不影响已注册的工具/系统提示/步数限制。
 //
 // 单独一个 setter 而不是复用 SetTools：切换审批模式（manual/model/auto）
 // 时没有理由连 registry、systemPrompt、maxSteps、toolTimeout 一起重设——
@@ -341,10 +364,13 @@ func (e *Executor) SetCheckpointer(cp session.CheckpointStore) {
 // 使用准则重复追加一遍）。调用方（Server.SetApprovalMode）只需要换掉
 // Approver 这一个字段。
 //
-// 并发安全：已经在跑的任务会在下一次 streamEvents 读取快照时拿到新值——
-// 当前实现里 streamEvents 对 e.approver 没有做快照读取（见下方 run 时机），
-// 而是 loop.New 时直接读 e.approver 字段，所以严格来说只影响"尚未进入
-// loop.New 构造"的那一刻。对运行中的单次工具调用没有影响：
+// 这是"全局默认"，会话级覆盖（Request.ApprovalMode + SetApproverResolver）
+// 优先级更高：某个会话一旦设置了自己的审批模式，这次热替换就不会影响它，
+// 只影响没有设置会话级覆盖的会话（见 streamEvents 里的解析逻辑）。
+//
+// 并发安全：streamEvents 在构造 loop.New 前会对 e.approver（以及
+// e.approverResolver）做一次快照读取，因此严格来说这次替换只影响
+// "尚未进入该快照读取"的执行。对运行中的单次工具调用没有影响：
 // evaluateApprovals 在同一轮 Run() 内只会读一次 Approver。
 func (e *Executor) SetApprover(approver loop.Approver) {
 	e.mu.Lock()
@@ -405,6 +431,16 @@ func (e *Executor) SetResolver(resolver RunnerResolver) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.resolver = resolver
+}
+
+// SetApproverResolver 注入按会话审批模式解析 Approver 的能力。
+//
+// 未注入时（nil），所有执行都用 e.approver（全局默认），
+// Request.ApprovalMode 字段会被忽略——与 SetResolver 的向后兼容语义一致。
+func (e *Executor) SetApproverResolver(resolver ApproverResolver) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.approverResolver = resolver
 }
 
 // ActiveCount 返回运行中的任务数（调试用）。
@@ -722,14 +758,28 @@ func (e *Executor) streamEvents(
 		// 读一次快照：配置可能在 Start 之后被 SetXXX 改动。
 		e.mu.Lock()
 		checkpointer := e.checkpointer
+		approver := e.approver
+		approverResolver := e.approverResolver
 		e.mu.Unlock()
+
+		// 会话记录了审批模式覆盖时，现场解析出对应的 Approver，
+		// 覆盖掉上面读到的全局默认；解析失败只记日志并回退，
+		// 不让整次执行失败（见 Request.ApprovalMode 的注释）。
+		if req.ApprovalMode != "" && approverResolver != nil {
+			if resolved, err := approverResolver(req.ApprovalMode); err != nil {
+				slog.Warn("会话审批模式解析失败，回退全局默认",
+					"err", err, "session_id", req.SessionID, "approval_mode", req.ApprovalMode)
+			} else {
+				approver = resolved
+			}
+		}
 
 		lp := loop.New(runner, loop.Config{
 			Registry:     e.registry,
 			SystemPrompt: e.systemPrompt,
 			MaxSteps:     e.maxSteps,
 			ToolTimeout:  e.toolTimeout,
-			Approver:     e.approver,
+			Approver:     approver,
 			// 关键：把 sessionID 传给 loop，checkpoint 以它为键落库。
 			SessionID:    req.SessionID,
 			Checkpointer: checkpointer,

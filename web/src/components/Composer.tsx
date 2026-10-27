@@ -2,13 +2,16 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useChat } from '../state/chatStore'
 import { useModels } from '../state/modelsStore'
 import { useApprovalMode } from '../state/approvalModeStore'
+import { useWorkspaces } from '../state/workspacesStore'
 import { ModelPicker } from './ModelPicker'
 import { ApprovalModePicker } from './ApprovalModePicker'
+import { WorkspacePicker } from './WorkspacePicker'
 import { AskUserCard } from './AskUserCard'
 import { ApprovalCard } from './ApprovalCard'
 
 interface ComposerProps {
   onOpenModelManager: () => void
+  onOpenWorkspaceManager: () => void
 }
 
 /**
@@ -25,7 +28,7 @@ interface ComposerProps {
  * 只能在 ApprovalCard 里点批准/拒绝，主输入框在这类挂起下只负责
  * 阻塞新消息、提示用户去卡片里处理，不参与答题逻辑。
  */
-export function Composer({ onOpenModelManager }: ComposerProps) {
+export function Composer({ onOpenModelManager, onOpenWorkspaceManager }: ComposerProps) {
   const {
     sendMessage,
     stopGeneration,
@@ -34,6 +37,8 @@ export function Composer({ onOpenModelManager }: ComposerProps) {
     phase,
     activeModelConfigId,
     setActiveModel,
+    activeWorkspaceId,
+    setActiveWorkspace,
     pendingQuestions,
     draftAnswers,
     setDraftAnswer,
@@ -41,6 +46,7 @@ export function Composer({ onOpenModelManager }: ComposerProps) {
     resume,
   } = useChat()
   const { models } = useModels()
+  const { workspaces } = useWorkspaces()
   const {
     mode: approvalMode,
     options: approvalModeOptions,
@@ -200,6 +206,13 @@ export function Composer({ onOpenModelManager }: ComposerProps) {
               }
               onChange={(id) => void setActiveModel(id)}
               onOpenManager={onOpenModelManager}
+            />
+            <WorkspacePicker
+              workspaces={workspaces}
+              value={activeWorkspaceId}
+              disabled={!currentId}
+              onChange={(id) => void setActiveWorkspace(id)}
+              onOpenManager={onOpenWorkspaceManager}
             />
             {approvalToolsEnabled && (
               <ApprovalModePicker

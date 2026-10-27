@@ -19,6 +19,7 @@ package api
 //     不需要为 resume 单独写一套事件管道。
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -313,11 +314,36 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 		s.respondStoreError(w, r, err)
 		return
 	}
+
+	// 顺手清理挂起期间留下的"僵尸" streaming 占位消息。
+	//
+	// 成因：上一次任务挂起时，当前这条 assistant 占位消息被落成
+	// status=streaming（见 executor.go 的 TypeAwaitingInput 分支），之后
+	// 那个任务就结束了——resume 会新建一条全新的占位消息承载后续生成，
+	// 不会再碰旧的这条。RepairHistory 只在**读**历史时在内存里把它纠正成
+	// complete/interrupted，从不回写数据库，于是库里会一直堆积这类用不上
+	// 但永远留着的消息。这里趁着已经有一份最新 history，顺手按
+	// RepairHistory 同样的判定标准回写一次，避免越积越多——
+	// 判定逻辑必须跟 fixStreamingStatus 完全一致，否则两处会在边界情况上
+	// 打架，所以特意加了交叉引用注释。失败只记日志：这是清理性质的操作，
+	// 不能因为它失败就卡住本次 resume 的主流程。
+	reconcileStreamingMessages(ctx, s.store, sessionID, history)
+
 	// resume 这一步已经把答案补成了 tool 结果，这里只需要再纠正一下
 	// 可能滞留 streaming 的历史消息状态（不处理悬空 tool_calls，
 	// 原因见 session.RepairHistory 的函数注释——resume 本身走的
 	// 正是 ask_user 挂起这个合法场景，不能被误判成"中断"）。
 	history = session.RepairHistory(history)
+
+	// 兜底检测：警告"孤儿 tool_calls"（有调用请求但历史里找不到配对结果）。
+	//
+	// 正常情况下不应该出现——loop.go 的 Run() 已经改成"同轮里不需要
+	// 挂起的调用先执行完、只把真正需要挂起的子集交给 suspendAll"，
+	// cp.Pendings 之外的调用理应都已经有配对的 tool 结果。这里只是
+	// 一道低成本的事后检测（纯日志，不做任何补偿执行）：如果未来又
+	// 出现类似"某个调用既不在 Pendings 里、也没有结果"的回归，能在
+	// 日志里第一时间发现，而不是等用户反馈"工具卡住了"才去翻代码。
+	warnOrphanedToolCalls(ctx, sessionID, history)
 
 	// 模型沿用会话上次的选择。
 	modelConfigID := sess.ModelConfigID
@@ -336,6 +362,7 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 		History:       history,
 		ModelConfigID: modelConfigID,
 		Model:         model,
+		ApprovalMode:  sess.ApprovalMode,
 		RunTimeout:    s.cfg.RunTimeout,
 	})
 	if startErr != nil {
@@ -426,6 +453,76 @@ func (s *Server) handleGetCheckpoint(w http.ResponseWriter, r *http.Request) {
 // itoa 把 Atoi 与 Itoa 的重复转换收敛成一行。
 func itoa(n int) string {
 	return strconv.Itoa(n)
+}
+
+// warnOrphanedToolCalls 扫描历史里所有 assistant 的 tool_calls，
+// 找出没有配对 tool 结果的 call_id 并记一条警告日志。
+//
+// 纯诊断用途：不做任何补偿执行，也不阻塞 resume 流程——发现孤儿调用时
+// 唯一能做的安全操作就是让模型知道"这条调用没有结果"，而这正是
+// session.RepairHistory 已经在做的事（见该函数注释）。这里只是在
+// RepairHistory 跑完之后再确认一遍"真的一个孤儿都没剩"，方便在日志里
+// 尽早发现类似 loop.go 挂起顺序这类回归，而不是等用户反馈才去排查。
+func warnOrphanedToolCalls(ctx context.Context, sessionID string, history []session.Message) {
+	resultOf := make(map[string]bool)
+	for _, m := range history {
+		if m.Role == session.RoleTool && m.ToolCallID != "" {
+			resultOf[m.ToolCallID] = true
+		}
+	}
+	for _, m := range history {
+		if m.Role != session.RoleAssistant || len(m.ToolCalls) == 0 {
+			continue
+		}
+		for _, tc := range m.ToolCalls {
+			if !resultOf[tc.ID] {
+				slog.WarnContext(ctx, "发现孤儿 tool_call（无配对结果，resume 前未能补齐）",
+					"session_id", sessionID, "call_id", tc.ID, "name", tc.Name)
+			}
+		}
+	}
+}
+
+// reconcileStreamingMessages 把历史里滞留在 streaming 的 assistant 消息
+// 回写成 complete/interrupted，落到数据库里（而不是只在内存里纠正）。
+//
+// 这些消息是上一次任务挂起时留下的占位：那次任务已经结束，不会再有
+// 任何代码更新它们；resume 会新建一条全新的占位消息承载后续生成，
+// 不会复用它们（见 session.RepairHistory 顶部注释）。RepairHistory 只在
+// **读**历史时做内存修正，不回写——于是库里会一直堆积这类用不上但
+// 永远留着的消息（纯数据卫生问题，不影响功能，RepairHistory 已经保证
+// 读到的历史是对的）。既然 resume 这一步已经要查一次最新 history，
+// 顺手把它们落库改正，避免越积越多。
+//
+// 判定标准必须跟 fixStreamingStatus（session/repair.go）完全一致：
+// 内容或 tool_calls 非空 → complete，否则 → interrupted。
+//
+// 失败只记日志：这是清理性质的操作，不能因为它失败就卡住本次 resume
+// 的主流程（主流程已经完成了真正要紧的事——补答案/执行已批准的操作）。
+func reconcileStreamingMessages(ctx context.Context, store session.Store, sessionID string, history []session.Message) {
+	for _, m := range history {
+		if m.Role != session.RoleAssistant || m.Status != session.StatusStreaming {
+			continue
+		}
+		msgID := m.ID
+		err := store.UpdateMessage(ctx, sessionID, msgID, func(mm *session.Message) error {
+			// double-check：UpdateMessage 在锁内重新读取一次最新状态，
+			// 避免并发场景下把已经被别处纠正过的消息又处理一遍。
+			if mm.Status != session.StatusStreaming {
+				return nil
+			}
+			if strings.TrimSpace(mm.Content) != "" || len(mm.ToolCalls) > 0 {
+				mm.Status = session.StatusComplete
+			} else {
+				mm.Status = session.StatusInterrupted
+			}
+			return nil
+		})
+		if err != nil {
+			slog.WarnContext(ctx, "回写挂起占位消息状态失败（不影响本次 resume，下次读取仍会被 RepairHistory 内存纠正）",
+				"err", err, "session_id", sessionID, "message_id", msgID)
+		}
+	}
 }
 
 /* ---- 答案键：call_id 与 call_id::qid 双写法 ---- */

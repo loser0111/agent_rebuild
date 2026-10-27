@@ -68,8 +68,22 @@ type Session struct {
 	// 为空表示使用全局默认配置。会话级选择的好处：
 	// 同一会话里切换模型后，历史消息与所选模型一起持久化，
 	// 重新打开会话时自动复用上次的选择。
-	ModelConfigID string            `json:"model_config_id,omitempty"`
-	Meta          map[string]string `json:"meta,omitempty"`
+	ModelConfigID string `json:"model_config_id,omitempty"`
+	// WorkspaceID 该会话绑定的 workspace（对应 workspaces.id）。
+	//
+	// 为空表示未绑定任何 workspace。与 ModelConfigID 同样的约定：
+	// 会话级选择，重新打开会话时自动沿用，不受其它会话影响。
+	// 注意：当前只做绑定关系的持久化，不参与任何工具调用的路径权限判断
+	// （见 docs/14-workspace-and-session-presets.md 第 6 节已知限制）。
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	// ApprovalMode 该会话的审批模式覆盖（manual/model/auto 的裸字符串）。
+	//
+	// 为空表示跟随进程级全局审批模式（PUT /api/approval-mode 可运行时切换的
+	// 那个开关）；非空时这个会话固定用自己的模式，不随全局开关的后续变化
+	// 而改变。取值合法性校验放在 API 层（internal/config.NormalizeApprovalMode），
+	// 本包保持零 internal 依赖的纯领域包定位，不反向依赖 config 包。
+	ApprovalMode string            `json:"approval_mode,omitempty"`
+	Meta         map[string]string `json:"meta,omitempty"`
 }
 
 // Message 一条消息。

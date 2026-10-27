@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { useChat } from '../state/chatStore'
+import { findDuplicateExecutedCall } from '../state/toolRestore'
 
 /** 参数 JSON 美化；解析失败原样显示（模型可能产出不完整的 JSON）。 */
 function prettyArgs(raw: string | undefined): string {
@@ -9,6 +10,20 @@ function prettyArgs(raw: string | undefined): string {
     return JSON.stringify(JSON.parse(text), null, 2)
   } catch {
     return text
+  }
+}
+
+/** 重复调用提示文案：status 不同措辞不同，让用户一眼知道"之前那次结果如何"。 */
+function duplicateHintText(status: 'running' | 'success' | 'error' | 'rejected'): string {
+  switch (status) {
+    case 'success':
+      return '提示：这条操作与之前一次已成功执行的调用参数完全相同，可能是模型重复发起——批准前请确认是否真的需要再执行一次。'
+    case 'running':
+      return '提示：这条操作与之前一次仍在执行中的调用参数完全相同，可能是模型重复发起。'
+    case 'rejected':
+      return '提示：这条操作与之前一次被拒绝的调用参数完全相同，模型可能又发起了一次同样的请求。'
+    default:
+      return '提示：这条操作与之前一次执行失败的调用参数完全相同，模型可能又发起了一次同样的请求。'
   }
 }
 
@@ -25,7 +40,7 @@ function prettyArgs(raw: string | undefined): string {
  * 用户点"提交决定"时一次性带上所有已做出的决定（未决定的留给下一次提交）。
  */
 export function ApprovalCard() {
-  const { pendingQuestions, isStreaming, resume } = useChat()
+  const { pendingQuestions, isStreaming, resume, toolCalls } = useChat()
   const pendings = pendingQuestions.filter((q) => q.kind === 'approval')
 
   // 本地决定草稿：call_id -> 'approve' | 'deny'。单独放在组件内部而不是
@@ -69,6 +84,9 @@ export function ApprovalCard() {
       {pendings.map((p) => {
         const decision = drafts[p.callId]
         const isDenying = denyingId === p.callId
+        // 同名同参数、但不是自己的调用：提示用户"这可能是模型重复发起的操作"。
+        // 纯提示，不拦截——参数相同不代表这次一定不该批准。
+        const duplicate = findDuplicateExecutedCall(p.toolName, p.toolArgs, p.callId, toolCalls)
         return (
           <div className="approval-item" key={p.callId}>
             <div className="approval-item-head">
@@ -80,6 +98,12 @@ export function ApprovalCard() {
             </div>
 
             {p.reason && <div className="approval-reason">{p.reason}</div>}
+
+            {duplicate && (
+              <div className="approval-duplicate-hint" title={`call_id: ${duplicate.call_id}`}>
+                {duplicateHintText(duplicate.status)}
+              </div>
+            )}
 
             <pre className="tool-pre">{prettyArgs(p.toolArgs)}</pre>
 

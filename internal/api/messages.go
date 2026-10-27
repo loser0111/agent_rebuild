@@ -157,6 +157,7 @@ func (s *Server) handleSendMessage(w http.ResponseWriter, r *http.Request) {
 		History:       history,
 		ModelConfigID: modelConfigID,
 		Model:         model,
+		ApprovalMode:  sess.ApprovalMode,
 		RunTimeout:    s.cfg.RunTimeout,
 	})
 	if startErr != nil {

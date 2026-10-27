@@ -29,7 +29,7 @@ var ErrSchemaTooNew = errors.New("sqlite: 数据库 schema 版本高于当前程
 
 // schemaVersion 是当前程序实现的 schema 版本。
 // 每次改动表结构时 +1，并在 migrate 里追加迁移步骤。
-const schemaVersion = 2
+const schemaVersion = 3
 
 // Open 打开（或创建）数据库并完成初始化。
 //
@@ -151,6 +151,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 	}{
 		{version: 1, sql: schemaV1},
 		{version: 2, sql: schemaV2},
+		{version: 3, sql: schemaV3},
 	}
 
 	for _, step := range steps {
@@ -281,4 +282,29 @@ const schemaV2 = `
 ALTER TABLE sessions ADD COLUMN model_config_id TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_sessions_model_config
     ON sessions(model_config_id);
+`
+
+// schemaV3 增加「会话绑定的 workspace」与「会话级审批模式覆盖」。
+//
+// 设计见 docs/14-workspace-and-session-presets.md：
+//   - workspaces 是独立实体（可被多个会话复用），folders 用 JSON 文本列存储，
+//     不拆子表——folders 不参与任何查询条件，拆表只会多一次 JOIN 成本。
+//   - sessions.workspace_id 刻意不加外键约束：删除 workspace 不应级联影响
+//     引用它的会话，语义上与 model_config_id 失效时的处理方式一致（使用时
+//     才报错，而不是删除那一刻去扫描清洗所有会话）。
+//   - sessions.approval_mode 为空表示"跟随进程级全局审批模式"，与
+//     model_config_id 为空回退全局默认模型是同一套既有约定。
+const schemaV3 = `
+CREATE TABLE IF NOT EXISTS workspaces (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL DEFAULT '',
+    folders    TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+ALTER TABLE sessions ADD COLUMN workspace_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN approval_mode TEXT NOT NULL DEFAULT '';
+CREATE INDEX IF NOT EXISTS idx_sessions_workspace
+    ON sessions(workspace_id);
 `

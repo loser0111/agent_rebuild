@@ -509,6 +509,29 @@ if (!gotLock) {
       return win ? win.isMaximized() : false
     })
 
+    // ---- 文件夹选择 IPC ----
+    //
+    // workspace 管理弹窗（WorkspaceManager.tsx）需要让用户用系统原生的
+    // 文件夹选择器挑目录，而不是手打绝对路径。渲染层被 sandbox 隔绝，
+    // 拿不到 Node 的 fs/path，也拿不到真实的文件系统路径（浏览器的
+    // <input type="file"> 出于安全不会暴露绝对路径），所以只能经主进程
+    // 调 Electron 的 dialog.showOpenDialog，再把选中的路径传回去。
+    //
+    // allowMultiple 支持一次选多个目录（macOS/Windows 原生对话框都支持
+    // 多选文件夹），减少用户一个一个点"+"的次数。取消选择返回空数组，
+    // 而不是 null/undefined，渲染层不需要再判空。
+    ipcMain.handle('dialog:select-folders', async (_event, options) => {
+      const win = BrowserWindow.getFocusedWindow() || mainWindow
+      const allowMultiple = Boolean(options && options.allowMultiple)
+      const properties = ['openDirectory', 'createDirectory']
+      if (allowMultiple) properties.push('multiSelections')
+      const result = win
+        ? await dialog.showOpenDialog(win, { properties })
+        : await dialog.showOpenDialog({ properties })
+      if (result.canceled) return []
+      return result.filePaths
+    })
+
     let url
     try {
       if (DEV_MODE) {

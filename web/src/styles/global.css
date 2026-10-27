@@ -372,6 +372,63 @@ a:hover {
   flex: 0 0 auto;
 }
 
+/* 会话按 workspace 分组（Sidebar.tsx 的 groupByWorkspace）。 */
+.session-group {
+  display: flex;
+  flex-direction: column;
+}
+
+.session-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 10px;
+  margin-top: 4px;
+  border-radius: var(--radius-sm);
+  color: var(--text-faint);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  text-align: left;
+  -webkit-app-region: no-drag;
+}
+
+.session-group-head:hover {
+  background: var(--bg-hover);
+  color: var(--text-soft);
+}
+
+.session-group-chevron {
+  display: inline-block;
+  font-size: 10px;
+  transition: transform 0.12s ease;
+}
+
+.session-group-chevron.is-collapsed {
+  transform: rotate(-90deg);
+}
+
+.session-group-title {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-group-count {
+  flex: 0 0 auto;
+  color: var(--text-faint);
+  font-weight: 400;
+}
+
+.session-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
 .mini {
   padding: 2px 7px;
   font-size: 11px;
@@ -1602,6 +1659,18 @@ kbd {
   color: var(--text-soft);
 }
 
+/* 提示"这条待审批操作与之前一次调用参数相同"——纯提示，不是报错，
+   所以用 warn 配色而不是 danger，避免用户误以为批准会出问题。 */
+.approval-duplicate-hint {
+  margin-bottom: 6px;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--warn);
+  background: var(--warn-soft);
+  border-radius: 6px;
+}
+
 .approval-decided {
   margin-left: auto;
   padding: 1px 7px;
@@ -2307,6 +2376,59 @@ kbd {
 
 .text-input::placeholder {
   color: var(--text-faint);
+}
+
+/* workspace 管理弹窗里的文件夹列表（WorkspaceManager.tsx）。 */
+.folder-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.folder-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.folder-path {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--text-soft);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* 路径习惯从左边截断更利于辨认（最后一段目录名最重要），
+   * 但纯 CSS 的 text-overflow 只支持从右截断，这里保留默认行为，
+   * 用 title 属性兜底，hover 能看到完整路径。 */
+}
+
+.folder-row .icon-btn {
+  width: 22px;
+  height: 22px;
+  font-size: 11px;
+  flex: 0 0 auto;
+}
+
+.folder-add-btn {
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.folder-manual-add {
+  display: flex;
+  gap: 6px;
+}
+
+.folder-manual-add .text-input {
+  flex: 1;
 }
 
 textarea.text-input {

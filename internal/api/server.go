@@ -20,6 +20,7 @@ import (
 	"agent_rebuild/internal/session"
 	"agent_rebuild/internal/sse"
 	"agent_rebuild/internal/tool"
+	"agent_rebuild/internal/workspace"
 )
 
 // Server 持有 HTTP 层需要的全部依赖。
@@ -37,6 +38,8 @@ type Server struct {
 
 	// models 模型配置存储（nil 表示当前驱动不支持）。
 	models modelconfig.Store
+	// workspaces workspace 存储（nil 表示当前驱动不支持，照 models 的先例）。
+	workspaces workspace.Store
 	// rebuildRunner 根据配置重建 Runner（运行时切换模型用）。
 	rebuildRunner func(*modelconfig.Config) (agent.Runner, error)
 	// tools 工具注册表（nil 表示未启用）。
@@ -83,6 +86,15 @@ func (s *Server) SetTools(registry *tool.Registry, systemPrompt string, maxSteps
 	}
 	approver := s.buildApprover(s.cfg.ApprovalMode)
 	s.exec.SetTools(registry, systemPrompt, maxSteps, timeout, approver)
+	// 会话级审批模式覆盖的解析器：复用 buildApprover 这同一份装配逻辑，
+	// 避免"全局切换"与"会话覆盖"两处各写一份 manual/model/auto 的 switch。
+	s.exec.SetApproverResolver(func(mode string) (loop.Approver, error) {
+		normalized, err := config.NormalizeApprovalMode(mode)
+		if err != nil {
+			return nil, err
+		}
+		return s.buildApprover(normalized), nil
+	})
 	s.tools = registry
 	s.approvalMu.Lock()
 	s.approvalMode = s.cfg.ApprovalMode

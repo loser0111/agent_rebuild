@@ -12,6 +12,7 @@ import { api, ApiRequestError } from '../api/client'
 import { streamPost } from '../api/sse'
 import { rebuildToolCalls } from './toolRestore'
 import type {
+  ApprovalMode,
   AwaitingInputData,
   HealthResponse,
   Message,
@@ -316,7 +317,17 @@ interface ChatContextValue extends ChatState {
   isStreaming: boolean
   /** 当前会话选用的模型配置 id（空表示用全局默认） */
   activeModelConfigId: string
-  createSession: () => Promise<void>
+  /**
+   * 新建会话。可选预设标题/模型/workspace/审批模式覆盖——
+   * 均对应创建接口里"创建时预设"的那几个字段（见 docs/14-workspace-and-session-presets.md）。
+   * 不传等同于以前的行为：建一个全空的会话，后续再用各 setActiveXxx 调整。
+   */
+  createSession: (input?: {
+    title?: string
+    modelConfigId?: string
+    workspaceId?: string
+    approvalMode?: ApprovalMode | ''
+  }) => Promise<void>
   selectSession: (id: string) => Promise<void>
   deleteSession: (id: string) => Promise<void>
   sendMessage: (content: string) => Promise<void>
@@ -341,6 +352,14 @@ interface ChatContextValue extends ChatState {
   dismissError: () => void
   /** 切换当前会话使用的模型配置（立即持久化到服务端） */
   setActiveModel: (modelConfigId: string) => Promise<void>
+  /** 当前会话绑定的 workspace id（空表示未绑定） */
+  activeWorkspaceId: string
+  /** 切换当前会话绑定的 workspace（立即持久化到服务端） */
+  setActiveWorkspace: (workspaceId: string) => Promise<void>
+  /** 当前会话的审批模式覆盖（空表示跟随全局 /api/approval-mode） */
+  activeApprovalModeOverride: ApprovalMode | ''
+  /** 切换当前会话的审批模式覆盖（立即持久化到服务端） */
+  setActiveApprovalModeOverride: (mode: ApprovalMode | '') => Promise<void>
 }
 
 const ChatContext = createContext<ChatContextValue | null>(null)
@@ -553,16 +572,29 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     void bootstrap()
   }, [bootstrap])
 
-  const createSession = useCallback(async () => {
-    try {
-      const { session } = await api.createSession({})
-      dispatch({ type: 'sessions/upsert', payload: session })
-      dispatch({ type: 'current/set', payload: session.id })
-      dispatch({ type: 'messages/loaded', payload: { messages: [], lastEventId: 0 } })
-    } catch (err) {
-      dispatch({ type: 'error/set', payload: describeError(err) })
-    }
-  }, [])
+  const createSession = useCallback(
+    async (input?: {
+      title?: string
+      modelConfigId?: string
+      workspaceId?: string
+      approvalMode?: ApprovalMode | ''
+    }) => {
+      try {
+        const { session } = await api.createSession({
+          title: input?.title,
+          model_config_id: input?.modelConfigId,
+          workspace_id: input?.workspaceId,
+          approval_mode: input?.approvalMode,
+        })
+        dispatch({ type: 'sessions/upsert', payload: session })
+        dispatch({ type: 'current/set', payload: session.id })
+        dispatch({ type: 'messages/loaded', payload: { messages: [], lastEventId: 0 } })
+      } catch (err) {
+        dispatch({ type: 'error/set', payload: describeError(err) })
+      }
+    },
+    [],
+  )
 
   const selectSession = useCallback(
     async (id: string) => {
@@ -1098,6 +1130,67 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     [state.sessions],
   )
 
+  /** 当前会话绑定的 workspace；会话没绑过则为空串。 */
+  const activeWorkspaceId = useMemo(() => {
+    const cur = state.sessions.find((s) => s.id === state.currentId)
+    return cur?.workspace_id ?? ''
+  }, [state.sessions, state.currentId])
+
+  /**
+   * 切换当前会话绑定的 workspace。与 setActiveModel 完全同构：
+   * 立即写服务端（刷新后仍生效），乐观更新 + 失败回滚。
+   */
+  const setActiveWorkspace = useCallback(
+    async (workspaceId: string) => {
+      const sessionId = currentIdRef.current
+      if (!sessionId) return
+      const before = state.sessions
+      dispatch({
+        type: 'sessions/patch',
+        payload: { id: sessionId, patch: { workspace_id: workspaceId } },
+      })
+      try {
+        const { session } = await api.setSessionWorkspace(sessionId, workspaceId)
+        dispatch({ type: 'sessions/upsert', payload: session })
+      } catch (err) {
+        dispatch({ type: 'sessions/loaded', payload: before })
+        dispatch({ type: 'error/set', payload: describeError(err) })
+      }
+    },
+    [state.sessions],
+  )
+
+  /** 当前会话的审批模式覆盖；会话没设置过则为空串（跟随全局）。 */
+  const activeApprovalModeOverride = useMemo(() => {
+    const cur = state.sessions.find((s) => s.id === state.currentId)
+    return cur?.approval_mode ?? ''
+  }, [state.sessions, state.currentId])
+
+  /**
+   * 切换当前会话的审批模式覆盖。与上面两个 setActiveXxx 同构，
+   * 但不检查 streamingRef——审批模式覆盖只影响"下一次"工具循环的
+   * Approver 装配，不像切模型那样会立刻改变正在进行中的生成。
+   */
+  const setActiveApprovalModeOverride = useCallback(
+    async (mode: ApprovalMode | '') => {
+      const sessionId = currentIdRef.current
+      if (!sessionId) return
+      const before = state.sessions
+      dispatch({
+        type: 'sessions/patch',
+        payload: { id: sessionId, patch: { approval_mode: mode } },
+      })
+      try {
+        const { session } = await api.setSessionApprovalMode(sessionId, mode)
+        dispatch({ type: 'sessions/upsert', payload: session })
+      } catch (err) {
+        dispatch({ type: 'sessions/loaded', payload: before })
+        dispatch({ type: 'error/set', payload: describeError(err) })
+      }
+    },
+    [state.sessions],
+  )
+
   const value = useMemo<ChatContextValue>(
     () => ({
       ...state,
@@ -1115,6 +1208,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       refreshPending,
       dismissError,
       setActiveModel,
+      activeWorkspaceId,
+      setActiveWorkspace,
+      activeApprovalModeOverride,
+      setActiveApprovalModeOverride,
     }),
     [
       state,
@@ -1131,6 +1228,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       refreshPending,
       dismissError,
       setActiveModel,
+      activeWorkspaceId,
+      setActiveWorkspace,
+      activeApprovalModeOverride,
+      setActiveApprovalModeOverride,
     ],
   )
 

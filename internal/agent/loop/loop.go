@@ -366,45 +366,51 @@ func (l *Loop) Run(ctx context.Context, history []session.Message, out chan<- ag
 
 		// ---- 审批决策：先算一次，结果在本轮内复用 ----
 		//
-		// 为什么要先算好再用两次（suspendAll 判断是否挂起、executeOne 判断
-		// 是否执行）：对 ModelApprover 来说 Approve() 是一次真实的 LLM 调用，
-		// 有延迟也有成本，不能在同一轮里被触发两次。
+		// 为什么要先算好再用两次（willSuspend/suspendAll 判断是否挂起、
+		// executeOne 判断是否执行）：对 ModelApprover 来说 Approve() 是一次
+		// 真实的 LLM 调用，有延迟也有成本，不能在同一轮里被触发两次。
 		outcomes := l.evaluateApprovals(ctx, toolCalls)
 
-		// ---- 先统一处理同轮里所有"要挂起"的调用 ----
+		// ---- 把本轮调用分成"立即执行"与"需要挂起"两类，先执行后挂起 ----
 		//
-		// 两类都要挂起：交互型调用（ask_user）与审批结果为 AwaitingHuman
-		// 的调用（人工审批模式下的写操作）。为什么必须先统一扫描再执行：
-		// 模型经常一口气抛多个问题/操作。早期实现在 executeOne 里遇到
-		// 第一个交互调用就挂起并 return，同轮后面的问题既不执行、也不落
-		// checkpoint——用户完全看不到它们，表现为「问题静默消失」。
+		// 这是这次修复的关键顺序调整。早期实现是"只要本轮有一个需要挂起的
+		// 调用，整轮一个都不执行"（suspendAll 在最前面，一旦挂起就直接
+		// return）。但模型经常把一个安全只读调用（如 list_dir）和一个需要
+		// 人工审批/回答的调用（如 run_command）放进同一轮。整轮不执行会
+		// 导致：list_dir 的 tool_call 事件已经发给前端（显示"调用中"），
+		// 但它既不会被执行、也不会进 checkpoint 的 Pendings（suspendAll
+		// 只收集 interactive/awaiting 两类），于是永久卡死——用户
+		// 批准/拒绝 run_command 之后，list_dir 依然没有任何结果，历史里
+		// 永远留着一条没有配对结果的 tool_calls。
 		//
-		// 现在改成：把同轮所有需要挂起的调用收集成一次挂起，
-		// 一条 checkpoint 里存全部 Pendings，前端一次展示多个问题/待批操作。
-		if l.suspendAll(ctx, toolCalls, outcomes, out, step) {
-			return res, nil
-		}
+		// 现在改成：先把"不需要挂起"的调用跑完（结果照常回灌模型上下文、
+		// 计入 l.completed），再把"需要挂起"的子集交给 suspendAll——
+		// suspendAll 本身的挂起判定/落 checkpoint 逻辑完全不变，只是
+		// 调用时机从"本轮最前面"挪到"本轮安全调用执行完之后"，输入范围
+		// 从"全部 toolCalls"收窄成"只有需要挂起的子集"。
+		var toSuspend []agent.ToolCall
+		executed := make(map[string]bool, len(toolCalls))
 
-		for _, call := range toolCalls {
-			// 记录当前步号，挂起时写进 checkpoint。
+		runOne := func(call agent.ToolCall) bool {
 			l.stepIndex = step
-
 			result := l.executeOne(ctx, call, outcomes[call.ID])
 
-			// 兜底：executeOne 里若因为降级失败而返回交互型调用，
-			// 上面 suspendAll 已经处理过，正常不会走到这里。
+			// 兜底：executeOne 里若因为降级失败而回落到交互型调用的
+			// suspend()，这里会被拦住。正常不会走到——交互型工具已经被
+			// willSuspend 分流进了 toSuspend。
 			if l.suspended != nil {
 				slog.Info("本轮因等待用户回答而挂起",
 					"session_id", l.cfg.SessionID, "call_id", call.ID, "step", step)
-				return res, nil
+				return false
 			}
 
+			executed[call.ID] = true
 			l.completed = append(l.completed, call.ID)
 			res.ToolResults = append(res.ToolResults, result)
 
 			// 发结果事件（UI 可展示「已执行」）。
 			if !emit(ctx, out, agent.Event{Type: agent.TypeToolResult, ToolResult: &result}) {
-				return res, ctx.Err()
+				return false
 			}
 
 			// 回喂给模型：以 tool 角色的消息追加。
@@ -417,6 +423,50 @@ func (l *Loop) Run(ctx context.Context, history []session.Message, out chan<- ag
 				CreatedAt:  time.Now().UTC(),
 				UpdatedAt:  time.Now().UTC(),
 			})
+			return true
+		}
+
+		for _, call := range toolCalls {
+			if l.willSuspend(call, outcomes) {
+				toSuspend = append(toSuspend, call)
+				continue
+			}
+			if !runOne(call) {
+				if l.suspended != nil {
+					return res, nil
+				}
+				return res, ctx.Err()
+			}
+		}
+
+		// ---- 再统一处理需要挂起的子集 ----
+		//
+		// 两类都要挂起：交互型调用（ask_user）与审批结果为 AwaitingHuman
+		// 的调用（人工审批模式下的写操作）。同轮里这两类可能有多个，
+		// suspendAll 会一次性收集成一条 checkpoint 的多个 Pendings，
+		// 前端一次展示多个问题/待批操作，而不是遇到第一个就挂起、
+		// 后面的问题静默消失。
+		if len(toSuspend) > 0 && l.suspendAll(ctx, toSuspend, outcomes, out, step) {
+			return res, nil
+		}
+
+		// suspendAll 返回 false 只有两种情况：toSuspend 为空（上面已经
+		// 跳过整个 if），或者命中了"无法挂起"的降级分支（缺 SessionID/
+		// Checkpointer，见 suspendAll 内部注释）。降级场景下这些调用还
+		// 没真正执行，要照常跑一遍——Denied/AwaitingHuman 两种 outcome
+		// 会在 executeOne 里直接产出"操作未执行"的错误结果，不会真正
+		// 调用工具。按原始 toolCalls 顺序重新过一遍（跳过已执行的），
+		// 保证产出顺序与模型发起 tool_calls 的顺序一致。
+		for _, call := range toolCalls {
+			if executed[call.ID] {
+				continue
+			}
+			if !runOne(call) {
+				if l.suspended != nil {
+					return res, nil
+				}
+				return res, ctx.Err()
+			}
 		}
 	}
 
@@ -458,6 +508,24 @@ func (l *Loop) evaluateApprovals(ctx context.Context, calls []agent.ToolCall) ma
 		out[call.ID] = approvalOutcome{decision, reason}
 	}
 	return out
+}
+
+// willSuspend 判断一个调用是否属于"需要挂起"的两类之一：
+//   - 交互型工具（ask_user 等 Spec().Interactive == true）；
+//   - 审批结果为 AwaitingHuman 的写操作（人工审批模式）。
+//
+// 必须与 suspendAll 内部的分类条件完全一致——这里只是把同一个判断
+// 提前到 Run() 里用于"先执行安全调用、再挂起剩余调用"的分流，
+// suspendAll 自己收到 toSuspend 子集后还会重新做一次同样的分类
+// （对它来说只是输入变窄了，逻辑不变），两处条件一旦不一致，
+// 就会出现"以为会挂起但其实不会"或反过来的错配。
+func (l *Loop) willSuspend(call agent.ToolCall, outcomes map[string]approvalOutcome) bool {
+	if l.cfg.Registry != nil {
+		if t, ok := l.cfg.Registry.Get(call.Name); ok && t.Spec().Interactive {
+			return true
+		}
+	}
+	return outcomes[call.ID].decision == AwaitingHuman
 }
 
 // executeOne 执行单个工具调用（含审批与超时）。

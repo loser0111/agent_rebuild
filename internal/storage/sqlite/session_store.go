@@ -68,9 +68,9 @@ func (s *SessionStore) Create(ctx context.Context, sess *session.Session) error 
 	}
 
 	_, err = s.db.SQL().ExecContext(ctx, `
-		INSERT INTO sessions (id, title, model, model_config_id, status, message_count, meta, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)`,
-		sess.ID, sess.Title, sess.Model, sess.ModelConfigID, string(sess.Status), meta,
+		INSERT INTO sessions (id, title, model, model_config_id, workspace_id, approval_mode, status, message_count, meta, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+		sess.ID, sess.Title, sess.Model, sess.ModelConfigID, sess.WorkspaceID, sess.ApprovalMode, string(sess.Status), meta,
 		toMillis(created), toMillis(now),
 	)
 	if err != nil {
@@ -88,7 +88,7 @@ func (s *SessionStore) Get(ctx context.Context, id string) (*session.Session, er
 		return nil, err
 	}
 	row := s.db.SQL().QueryRowContext(ctx, `
-		SELECT id, title, model, model_config_id, status, message_count, meta, created_at, updated_at
+		SELECT id, title, model, model_config_id, workspace_id, approval_mode, status, message_count, meta, created_at, updated_at
 		FROM sessions WHERE id = ?`, id)
 
 	sess, err := scanSession(row)
@@ -120,7 +120,7 @@ func (s *SessionStore) List(ctx context.Context, opts session.ListOptions) ([]*s
 	)
 	if opts.Cursor == "" {
 		rows, err = s.db.SQL().QueryContext(ctx, `
-			SELECT id, title, model, model_config_id, status, message_count, meta, created_at, updated_at
+			SELECT id, title, model, model_config_id, workspace_id, approval_mode, status, message_count, meta, created_at, updated_at
 			FROM sessions
 			ORDER BY updated_at DESC, id DESC
 			LIMIT ?`, limit)
@@ -139,7 +139,7 @@ func (s *SessionStore) List(ctx context.Context, opts session.ListOptions) ([]*s
 			return nil, "", fmt.Errorf("sqlite: 解析游标失败: %w", err)
 		}
 		rows, err = s.db.SQL().QueryContext(ctx, `
-			SELECT id, title, model, model_config_id, status, message_count, meta, created_at, updated_at
+			SELECT id, title, model, model_config_id, workspace_id, approval_mode, status, message_count, meta, created_at, updated_at
 			FROM sessions
 			WHERE (updated_at < ?) OR (updated_at = ? AND id < ?)
 			ORDER BY updated_at DESC, id DESC
@@ -186,7 +186,7 @@ func (s *SessionStore) Update(ctx context.Context, id string, fn func(*session.S
 	defer func() { _ = tx.Rollback() }()
 
 	row := tx.QueryRowContext(ctx, `
-		SELECT id, title, model, model_config_id, status, message_count, meta, created_at, updated_at
+		SELECT id, title, model, model_config_id, workspace_id, approval_mode, status, message_count, meta, created_at, updated_at
 		FROM sessions WHERE id = ?`, id)
 	sess, err := scanSession(row)
 	if err != nil {
@@ -222,9 +222,9 @@ func (s *SessionStore) Update(ctx context.Context, id string, fn func(*session.S
 	}
 	if _, err := tx.ExecContext(ctx, `
 		UPDATE sessions
-		SET title = ?, model = ?, model_config_id = ?, status = ?, message_count = ?, meta = ?, updated_at = ?
+		SET title = ?, model = ?, model_config_id = ?, workspace_id = ?, approval_mode = ?, status = ?, message_count = ?, meta = ?, updated_at = ?
 		WHERE id = ?`,
-		sess.Title, sess.Model, sess.ModelConfigID, string(sess.Status), sess.MessageCount, meta,
+		sess.Title, sess.Model, sess.ModelConfigID, sess.WorkspaceID, sess.ApprovalMode, string(sess.Status), sess.MessageCount, meta,
 		toMillis(sess.UpdatedAt), id,
 	); err != nil {
 		return nil, fmt.Errorf("sqlite: 更新会话失败: %w", err)
@@ -481,7 +481,7 @@ func scanSession(sc scanner) (*session.Session, error) {
 		created int64
 		updated int64
 	)
-	if err := sc.Scan(&sess.ID, &sess.Title, &sess.Model, &sess.ModelConfigID, &status,
+	if err := sc.Scan(&sess.ID, &sess.Title, &sess.Model, &sess.ModelConfigID, &sess.WorkspaceID, &sess.ApprovalMode, &status,
 		&sess.MessageCount, &meta, &created, &updated); err != nil {
 		return nil, err
 	}

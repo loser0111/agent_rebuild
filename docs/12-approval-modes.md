@@ -166,6 +166,60 @@ func ExecuteApproved(ctx context.Context, registry *tool.Registry, timeout time.
 }
 ```
 
+### 3.6 混合批次（Safe + Dangerous/Interactive 同轮）：先执行、后挂起
+
+**问题**（2026-10-27 发现的真实 bug）：模型经常在同一轮里一口气抛出多个
+工具调用，其中混着不需要审批的安全调用（比如 `list_dir`）和需要挂起
+等人的调用（`ask_user`，或人工审批模式下的 `run_command`/`write_file`）。
+
+早期实现是"只要本轮有一个需要挂起的调用，整轮一个都不执行"——
+`suspendAll` 在 `Run()` 的工具执行循环**最前面**调用，一旦判定要挂起
+就直接 `return`，连一个安全调用都不会跑。但工具调用的 `tool_call`
+事件在模型流式输出阶段就已经发给前端了（远早于 `suspendAll` 判断），
+于是前端上会看到：`run_command` 要求审批、`list_dir` 停在"调用中"，
+用户批准/拒绝 `run_command` 之后，`list_dir` 依然卡死——它既没被执行，
+也没进 `checkpoint.Pendings`（`suspendAll` 只收集 interactive/awaiting
+两类），**永久没有结果**，历史里留下一条没有配对 tool 结果的
+`assistant(tool_calls)`，下次请求会被模型 API 拒绝或让模型困惑。
+
+**修复**：把 `Run()` 的工具执行循环改成两阶段：
+
+1. 先用 `willSuspend(call, outcomes)`（与 `suspendAll` 内部判定条件
+   完全一致：`Interactive` 工具，或 `outcome.decision == AwaitingHuman`）
+   把本轮 `toolCalls` 分成「立即执行」与「需要挂起」两组。
+2. 立即执行组按原始顺序跑完（`executeOne` → 发 `ToolResult` 事件 →
+   累进 `l.completed` → 追加进 `working`），**然后**才把需要挂起的子组
+   交给 `suspendAll`——`suspendAll` 自身的挂起判定、落 checkpoint 逻辑
+   完全不变，只是调用时机往后挪、输入范围收窄成子集。
+3. `suspendAll` 若因为"无法挂起"（缺 `SessionID`/`Checkpointer`）降级
+   返回 `false`，还没执行的调用（此时只可能是 interactive/awaiting 的
+   降级场景）按原始顺序补跑一遍，行为与旧实现完全一致。
+
+效果：同一轮里，`list_dir` 这类安全调用永远会先拿到结果（无论本轮是否
+有调用需要挂起），只有真正需要人工介入的那部分调用被挂起等待。
+`Checkpoint.Completed` 现在会忠实记录"本轮已执行的 call_id"（包括这批
+提前执行的安全调用），尽管目前仍然**没有任何代码读取它做跳过判断**
+（见下方说明）——纯粹是为将来接幂等重放留的数据，不是这次修复依赖的
+机制。
+
+**顺带澄清的一个历史疑点**：`session.Checkpoint` 的文档注释曾写
+"`Completed` 记录本轮已产出结果的 call_id，resume 时跳过，让重放幂等"，
+但实际检查 `internal/api/resume.go` 和 `loop.go` 全文，没有任何地方
+读取 `cp.Completed` 做跳过判断——`resume.go` 完全是按 `cp.Pendings`
+逐个处理（`PendingInput` 补答案、`PendingApproval` 走 `ExecuteApproved`
+真正执行），从未检查某个 call_id 是否已经在 `Completed` 里。这个字段
+目前是纯写入（落库、Clone、测试断言往返），对应 `docs/07-orchestration-
+decision.md` 里"项 B：`Completed` 幂等重放"这个尚未实现的方案。
+这次修复不依赖、也不实现这条幂等重放逻辑，只是确认了它当前确实是
+空挡——如果以后要做"进程重启后从 checkpoint 恢复到半轮执行状态"这类
+更激进的重放，需要先把这条路径接上，而不是假设它已经在工作。
+
+另外在 `internal/api/resume.go` 里加了一道低成本的事后诊断
+（`warnOrphanedToolCalls`）：resume 时扫描历史里所有 `assistant.tool_
+calls`，警告任何没有配对 tool 结果的 call_id。纯日志、不做补偿执行——
+这次修复已经从根上让孤儿调用不会再产生，这道检测只是留个哨兵，
+万一以后又出现类似回归，能在日志里第一时间发现。
+
 ---
 
 ## 4. 三种模式各自的实现

@@ -2,11 +2,14 @@ import { useEffect, useState } from 'react'
 import { ChatProvider, useChat } from './state/chatStore'
 import { ModelsProvider } from './state/modelsStore'
 import { ApprovalModeProvider } from './state/approvalModeStore'
+import { WorkspacesProvider } from './state/workspacesStore'
 import { Sidebar } from './components/Sidebar'
 import { ChatView } from './components/ChatView'
 import { Composer } from './components/Composer'
 import { StatusBar } from './components/StatusBar'
 import { ModelManager } from './components/ModelManager'
+import { WorkspaceManager } from './components/WorkspaceManager'
+import { SessionSettingsDialog } from './components/SessionSettingsDialog'
 
 /** 桌面壳注入的窗口控制接口（仅 Electron 下存在）。 */
 interface WindowControl {
@@ -14,10 +17,24 @@ interface WindowControl {
   isMaximized: () => Promise<boolean>
 }
 
+/**
+ * 桌面壳注入的原生文件夹选择器（仅 Electron 下存在）。
+ *
+ * 渲染层被 contextIsolation+sandbox 隔绝，拿不到真实文件系统路径
+ * （浏览器 <input type="file"> 出于安全不会暴露绝对路径），只能经
+ * 主进程弹系统原生对话框，再把选中路径传回来——WorkspaceManager.tsx
+ * 用它实现"点 + 选文件夹"而不是手打路径。
+ */
+interface FileDialog {
+  /** 取消选择时返回空数组，不是 null/undefined。 */
+  selectFolders: (options?: { allowMultiple?: boolean }) => Promise<string[]>
+}
+
 declare global {
   interface Window {
     desktopEnv?: { isDesktop: boolean; platform: string }
     windowControl?: WindowControl
+    fileDialog?: FileDialog
   }
 }
 
@@ -32,9 +49,11 @@ export default function App() {
   return (
     <ModelsProvider>
       <ApprovalModeProvider>
-        <ChatProvider>
-          <Shell desktop={desktop} />
-        </ChatProvider>
+        <WorkspacesProvider>
+          <ChatProvider>
+            <Shell desktop={desktop} />
+          </ChatProvider>
+        </WorkspacesProvider>
       </ApprovalModeProvider>
     </ModelsProvider>
   )
@@ -44,6 +63,8 @@ function Shell({ desktop }: { desktop: boolean }) {
   const { error, dismissError, currentId, sessions } = useChat()
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [modelManagerOpen, setModelManagerOpen] = useState(false)
+  const [workspaceManagerOpen, setWorkspaceManagerOpen] = useState(false)
+  const [sessionSettingsOpen, setSessionSettingsOpen] = useState(false)
 
   const current = sessions.find((s) => s.id === currentId)
 
@@ -100,6 +121,28 @@ function Shell({ desktop }: { desktop: boolean }) {
 
           <div className="topbar-right">
             {current && <div className="topbar-model">{current.model}</div>}
+            {/* 当前会话设置：绑定模型/workspace/审批模式覆盖，需先选中一个会话 */}
+            {current && (
+              <button
+                className="icon-btn"
+                type="button"
+                onClick={() => setSessionSettingsOpen(true)}
+                title="会话设置"
+                aria-label="会话设置"
+              >
+                ⚙️
+              </button>
+            )}
+            {/* 窗口右上角的 workspace 管理入口 */}
+            <button
+              className="icon-btn"
+              type="button"
+              onClick={() => setWorkspaceManagerOpen(true)}
+              title="workspace 管理"
+              aria-label="workspace 管理"
+            >
+              📁
+            </button>
             {/* 窗口右上角的模型配置入口 */}
             <button
               className="icon-btn"
@@ -123,13 +166,22 @@ function Shell({ desktop }: { desktop: boolean }) {
         )}
 
         <ChatView />
-        <Composer onOpenModelManager={() => setModelManagerOpen(true)} />
+        <Composer
+          onOpenModelManager={() => setModelManagerOpen(true)}
+          onOpenWorkspaceManager={() => setWorkspaceManagerOpen(true)}
+        />
         <StatusBar />
       </main>
 
       {sidebarOpen && <div className="scrim" onClick={() => setSidebarOpen(false)} />}
 
       <ModelManager open={modelManagerOpen} onClose={() => setModelManagerOpen(false)} />
+      <WorkspaceManager open={workspaceManagerOpen} onClose={() => setWorkspaceManagerOpen(false)} />
+      <SessionSettingsDialog
+        open={sessionSettingsOpen}
+        onClose={() => setSessionSettingsOpen(false)}
+        session={current}
+      />
     </div>
   )
 }

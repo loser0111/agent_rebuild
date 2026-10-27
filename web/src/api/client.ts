@@ -1,6 +1,7 @@
 /* REST 客户端封装：统一错误处理，不引入 axios。 */
 import type {
   ApiError,
+  ApprovalMode,
   ApprovalModeResponse,
   CheckpointResponse,
   CreateSessionResponse,
@@ -11,6 +12,9 @@ import type {
   ModelConfigListResponse,
   SessionDetailResponse,
   TestModelConfigResponse,
+  Workspace,
+  WorkspaceInput,
+  WorkspaceListResponse,
 } from './types'
 
 /** 业务/网络错误统一类型 */
@@ -74,7 +78,17 @@ export const api = {
   listSessions: (limit = 50) =>
     request<ListSessionsResponse>(`/sessions?limit=${limit}`),
 
-  createSession: (input: { title?: string; model?: string; model_config_id?: string } = {}) =>
+  createSession: (
+    input: {
+      title?: string
+      model?: string
+      model_config_id?: string
+      /** 创建时预设绑定的 workspace；见 docs/14-workspace-and-session-presets.md */
+      workspace_id?: string
+      /** 创建时预设的会话级审批模式覆盖；留空表示跟随全局 */
+      approval_mode?: ApprovalMode | ''
+    } = {},
+  ) =>
     request<CreateSessionResponse>('/sessions', {
       method: 'POST',
       body: JSON.stringify(input),
@@ -93,6 +107,25 @@ export const api = {
     request<CreateSessionResponse>(`/sessions/${id}`, {
       method: 'PATCH',
       body: JSON.stringify({ model_config_id: modelConfigId }),
+    }),
+
+  /** 切换会话绑定的 workspace；传空串表示解绑。 */
+  setSessionWorkspace: (id: string, workspaceId: string) =>
+    request<CreateSessionResponse>(`/sessions/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ workspace_id: workspaceId }),
+    }),
+
+  /**
+   * 切换会话级审批模式覆盖；传空串表示回退到跟随全局（/api/approval-mode）。
+   *
+   * 与下面 setApprovalMode 的区别：这个只影响当前会话，不影响全局开关，
+   * 也不影响其他会话——见 docs/14-workspace-and-session-presets.md。
+   */
+  setSessionApprovalMode: (id: string, mode: ApprovalMode | '') =>
+    request<CreateSessionResponse>(`/sessions/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ approval_mode: mode }),
     }),
 
   deleteSession: (id: string) =>
@@ -133,6 +166,18 @@ export const api = {
 
   testModel: (id: string) =>
     request<TestModelConfigResponse>(`/models/${id}/test`, { method: 'POST' }),
+
+  /* ---- workspace（会话可绑定的多文件夹集合，见 docs/14-workspace-and-session-presets.md） ---- */
+
+  listWorkspaces: () => request<WorkspaceListResponse>('/workspaces'),
+
+  createWorkspace: (input: WorkspaceInput) =>
+    request<Workspace>('/workspaces', { method: 'POST', body: JSON.stringify(input) }),
+
+  updateWorkspace: (id: string, input: WorkspaceInput) =>
+    request<Workspace>(`/workspaces/${id}`, { method: 'PUT', body: JSON.stringify(input) }),
+
+  deleteWorkspace: (id: string) => request<void>(`/workspaces/${id}`, { method: 'DELETE' }),
 
   /* ---- 审批模式（运行时切换，见 docs/12-approval-modes.md） ---- */
 
