@@ -9,7 +9,7 @@ import (
 
 // Publish 必须分配单调递增的 seq，并把它同时写进帧 ID 与业务负载。
 func TestHubPublishAssignsMonotonicSeq(t *testing.T) {
-	h := NewHub(10)
+	h := NewHub(10, 0, 0)
 
 	for i := 1; i <= 5; i++ {
 		ev := h.Publish("s1", func(seq uint64) Event {
@@ -33,7 +33,7 @@ func TestHubPublishAssignsMonotonicSeq(t *testing.T) {
 
 // 不同会话的 seq 相互独立。
 func TestHubSeqIsPerKey(t *testing.T) {
-	h := NewHub(10)
+	h := NewHub(10, 0, 0)
 	h.Publish("a", func(seq uint64) Event { return Event{Name: EventPing} })
 	h.Publish("a", func(seq uint64) Event { return Event{Name: EventPing} })
 	h.Publish("b", func(seq uint64) Event { return Event{Name: EventPing} })
@@ -48,7 +48,7 @@ func TestHubSeqIsPerKey(t *testing.T) {
 
 // 订阅者应实时收到 Publish 的事件。
 func TestHubSubscribeReceivesLive(t *testing.T) {
-	h := NewHub(10)
+	h := NewHub(10, 0, 0)
 	_, live, cancel, ok := h.Subscribe("s", 0)
 	if !ok {
 		t.Fatal("空缓冲时 Subscribe 应返回 ok=true")
@@ -75,7 +75,7 @@ func TestHubSubscribeReceivesLive(t *testing.T) {
 
 // 按 after 重放缓冲事件。
 func TestHubSubscribeReplays(t *testing.T) {
-	h := NewHub(10)
+	h := NewHub(10, 0, 0)
 	for i := 0; i < 5; i++ {
 		h.Publish("s", func(seq uint64) Event { return Event{Name: EventMessageDelta} })
 	}
@@ -95,7 +95,7 @@ func TestHubSubscribeReplays(t *testing.T) {
 
 // 缓冲已裁剪时 Subscribe 返回 ok=false，调用方应改发 resync。
 func TestHubSubscribeSignalsResync(t *testing.T) {
-	h := NewHub(2)
+	h := NewHub(2, 0, 0)
 	for i := 0; i < 5; i++ {
 		h.Publish("s", func(seq uint64) Event { return Event{Name: EventMessageDelta} })
 	}
@@ -108,7 +108,7 @@ func TestHubSubscribeSignalsResync(t *testing.T) {
 
 // 取消订阅后不应再收到事件，且不 panic。
 func TestHubCancelUnsubscribes(t *testing.T) {
-	h := NewHub(10)
+	h := NewHub(10, 0, 0)
 	_, _, cancel, _ := h.Subscribe("s", 0)
 	cancel()
 
@@ -121,7 +121,7 @@ func TestHubCancelUnsubscribes(t *testing.T) {
 
 // 慢订阅者：通道满时丢弃事件而不是阻塞 Publish。
 func TestHubSlowSubscriberDoesNotBlock(t *testing.T) {
-	h := NewHub(1000)
+	h := NewHub(1000, 0, 0)
 	_, live, cancel, _ := h.Subscribe("s", 0)
 	defer cancel()
 
@@ -157,7 +157,7 @@ func TestHubSlowSubscriberDoesNotBlock(t *testing.T) {
 
 // 并发 Publish 与 Subscribe 必须安全（-race 下验证）。
 func TestHubConcurrentPublishSubscribe(t *testing.T) {
-	h := NewHub(100)
+	h := NewHub(100, 0, 0)
 	const pubN, subN = 50, 8
 
 	var wg sync.WaitGroup
@@ -193,7 +193,7 @@ func TestHubConcurrentPublishSubscribe(t *testing.T) {
 
 // Drop 清理会话状态。
 func TestHubDrop(t *testing.T) {
-	h := NewHub(10)
+	h := NewHub(10, 0, 0)
 	h.Publish("s", func(seq uint64) Event { return Event{Name: EventPing} })
 	_, _, cancel, _ := h.Subscribe("s", 0)
 	defer cancel()
@@ -209,7 +209,7 @@ func TestHubDrop(t *testing.T) {
 
 // 事件数据必须能独立序列化（前端按 JSON 解析）。
 func TestHubEventDataSerializable(t *testing.T) {
-	h := NewHub(10)
+	h := NewHub(10, 0, 0)
 	ev := h.Publish("s", func(seq uint64) Event {
 		return Event{
 			Name: EventMessageStart,

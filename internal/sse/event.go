@@ -18,6 +18,7 @@ const (
 	EventPing               = "ping"
 	EventError              = "error"
 	EventResync             = "resync"
+	EventBufferOverflow     = "buffer.overflow" // SSE 缓冲溢出，要求前端重连
 
 	// 工具相关事件（参考 Codex / Claude Code 的展示方式）。
 	EventToolCall     = "tool.call"     // 模型请求调用工具

@@ -66,8 +66,10 @@ type Config struct {
 	MaxMessagesPerSession int    // MAX_MESSAGES_PER_SESSION
 
 	// SSE
-	SSEPingInterval time.Duration // SSE_PING_INTERVAL
-	SSEBufferSize   int           // SSE_BUFFER_SIZE
+	SSEPingInterval          time.Duration // SSE_PING_INTERVAL
+	SSEBufferSize            int           // SSE_BUFFER_SIZE
+	SSESubscriberBufferSize  int           // SSE_SUBSCRIBER_BUFFER_SIZE；每个订阅者的事件队列缓冲大小
+	SSEMaxMessageDeltaChunks int           // SSE_MAX_MESSAGE_DELTA_CHUNKS；单条消息最多缓冲的 delta 事件数
 
 	// 生成
 	RunTimeout time.Duration // RUN_TIMEOUT
@@ -106,17 +108,19 @@ type Config struct {
 // Load 读取环境变量并校验。校验失败立即返回错误（快速失败）。
 func Load() (*Config, error) {
 	c := &Config{
-		Port:                  envString("PORT", "8080"),
-		Env:                   envString("APP_ENV", "dev"),
-		CORSOrigins:           envList("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"),
-		ReadTimeout:           envDuration("HTTP_READ_TIMEOUT", 30*time.Second),
-		StoreDriver:           envString("STORE_DRIVER", "memory"),
-		MaxMessagesPerSession: envInt("MAX_MESSAGES_PER_SESSION", 200),
-		SSEPingInterval:       envDuration("SSE_PING_INTERVAL", 15*time.Second),
-		SSEBufferSize:         envInt("SSE_BUFFER_SIZE", 1000),
-		RunTimeout:            envDuration("RUN_TIMEOUT", 180*time.Second),
-		LLMTimeout:            envDuration("LLM_TIMEOUT", 120*time.Second),
-		LLMProvider:           strings.TrimSpace(envString("LLM_PROVIDER", "mock")),
+		Port:                     envString("PORT", "8080"),
+		Env:                      envString("APP_ENV", "dev"),
+		CORSOrigins:              envList("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"),
+		ReadTimeout:              envDuration("HTTP_READ_TIMEOUT", 30*time.Second),
+		StoreDriver:              envString("STORE_DRIVER", "memory"),
+		MaxMessagesPerSession:    envInt("MAX_MESSAGES_PER_SESSION", 200),
+		SSEPingInterval:          envDuration("SSE_PING_INTERVAL", 15*time.Second),
+		SSEBufferSize:            envInt("SSE_BUFFER_SIZE", 10000),
+		SSESubscriberBufferSize:  envInt("SSE_SUBSCRIBER_BUFFER_SIZE", 4096),
+		SSEMaxMessageDeltaChunks: envInt("SSE_MAX_MESSAGE_DELTA_CHUNKS", 50000),
+		RunTimeout:               envDuration("RUN_TIMEOUT", 180*time.Second),
+		LLMTimeout:               envDuration("LLM_TIMEOUT", 120*time.Second),
+		LLMProvider:              strings.TrimSpace(envString("LLM_PROVIDER", "mock")),
 		// BaseURL / Model 初始为空：完全由 provider 预设决定，
 		// 用户显式指定时才覆盖（见下方 explicit* 判断）。
 		LLMBaseURL:   strings.TrimSpace(os.Getenv("LLM_BASE_URL")),
@@ -222,6 +226,12 @@ func Load() (*Config, error) {
 	}
 	if c.SSEBufferSize <= 0 {
 		return nil, fmt.Errorf("config: SSE_BUFFER_SIZE 必须为正数")
+	}
+	if c.SSESubscriberBufferSize <= 0 {
+		return nil, fmt.Errorf("config: SSE_SUBSCRIBER_BUFFER_SIZE 必须为正数")
+	}
+	if c.SSEMaxMessageDeltaChunks <= 0 {
+		return nil, fmt.Errorf("config: SSE_MAX_MESSAGE_DELTA_CHUNKS 必须为正数")
 	}
 	return c, nil
 }

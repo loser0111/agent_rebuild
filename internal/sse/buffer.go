@@ -5,25 +5,31 @@ import "sync"
 // Buffer 是会话维度的事件环形缓冲，用于 Last-Event-ID 重放。
 // 超过容量时丢弃最旧事件；重放请求的 lastID 若已被裁剪，调用方应改发 resync。
 type Buffer struct {
-	mu   sync.RWMutex
-	size int
-	buf  []Event // 按 ID 升序
+	mu         sync.RWMutex
+	size       int
+	buf        []Event // 按 ID 升序
+	minDropped uint64  // 已被裁剪的最小 ID（用于判断是否需要 resync）
 }
 
-// NewBuffer 创建容量为 size 的缓冲（size <= 0 时默认 1000）。
+// NewBuffer 创建容量为 size 的缓冲（size <= 0 时默认 10000）。
 func NewBuffer(size int) *Buffer {
 	if size <= 0 {
-		size = 1000
+		size = 10000
 	}
 	return &Buffer{size: size, buf: make([]Event, 0, size)}
 }
 
 // Push 追加事件，返回写入后的当前最大 ID。
+// 当缓冲超过容量时，记录被丢弃的最旧事件 ID。
 func (b *Buffer) Push(ev Event) uint64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.buf = append(b.buf, ev)
 	if len(b.buf) > b.size {
+		// 记录被裁剪的最旧事件 ID
+		if len(b.buf) > 0 {
+			b.minDropped = b.buf[0].ID
+		}
 		b.buf = b.buf[len(b.buf)-b.size:]
 	}
 	return ev.ID

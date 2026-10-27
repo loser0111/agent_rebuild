@@ -57,7 +57,7 @@ type Server struct {
 
 // NewServer 组装 HTTP 层依赖。
 func NewServer(cfg *config.Config, store session.Store, runner agent.Runner, locks *agent.Locks) *Server {
-	hub := sse.NewHub(cfg.SSEBufferSize)
+	hub := sse.NewHub(cfg.SSEBufferSize, cfg.SSESubscriberBufferSize, cfg.SSEMaxMessageDeltaChunks)
 	s := &Server{
 		cfg:       cfg,
 		store:     store,

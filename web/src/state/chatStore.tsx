@@ -753,6 +753,17 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         })
         break
       }
+      case 'buffer.overflow': {
+        // SSE 缓冲溢出：提示用户重新连接以同步完整状态
+        dispatch({ type: 'stream/phase', payload: 'reconnecting' })
+        dispatch({
+          type: 'reconnect/hint',
+          payload: '缓冲溢出，正在重新同步完整数据...',
+        })
+        // 自动触发重连：获取最新状态
+        window.location.href = window.location.href
+        break
+      }
       case 'error': {
         settledRef.current = true
         const payload = ev.data as { error?: { message?: string } }

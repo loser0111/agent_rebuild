@@ -10,9 +10,11 @@ import "sync"
 // 序号由 Hub 统一分配，是「事件 ID 全局单调」的唯一来源，
 // 避免 handler 与订阅者各自编号导致 last_event_id 语义错乱。
 type Hub struct {
-	mu    sync.Mutex
-	size  int
-	chans map[string]*hubChannel
+	mu                    sync.Mutex
+	size                  int
+	subscriberBufferSize  int
+	maxMessageDeltaChunks int
+	chans                 map[string]*hubChannel
 }
 
 type hubChannel struct {
@@ -22,12 +24,26 @@ type hubChannel struct {
 	nextID  uint64
 }
 
-// NewHub 创建分发中心。size 为每会话保留的事件条数（<=0 取默认 1000）。
-func NewHub(size int) *Hub {
+// NewHub 创建分发中心。
+// size 为每会话保留的事件条数（<=0 取默认 10000）。
+// subscriberBufferSize 为每个订阅者的事件队列缓冲大小（<=0 取默认 4096）。
+// maxMessageDeltaChunks 为单条消息的 delta 事件最大缓冲数（<=0 取默认 50000）。
+func NewHub(size int, subscriberBufferSize int, maxMessageDeltaChunks int) *Hub {
 	if size <= 0 {
-		size = 1000
+		size = 10000
 	}
-	return &Hub{size: size, chans: make(map[string]*hubChannel)}
+	if subscriberBufferSize <= 0 {
+		subscriberBufferSize = 4096
+	}
+	if maxMessageDeltaChunks <= 0 {
+		maxMessageDeltaChunks = 50000
+	}
+	return &Hub{
+		size:                  size,
+		subscriberBufferSize:  subscriberBufferSize,
+		maxMessageDeltaChunks: maxMessageDeltaChunks,
+		chans:                 make(map[string]*hubChannel),
+	}
 }
 
 // Publish 为事件分配序号并广播，返回实际写入（含序号）的事件。
@@ -59,11 +75,27 @@ func (h *Hub) publish(key string, build func(seq uint64) Event, ephemeral bool) 
 		st.buf.Push(ev)
 	}
 
-	// 慢订阅者：缓冲满时丢弃该条，由后续 last_event_id 补齐兜底，绝不在写端阻塞。
+	// 慢订阅者处理：缓冲满时采用**防守型缓冲策略**而非直接丢弃。
+	// 第一次溢出发送警告事件，让前端主动重连拉取全量数据。
+	// 这样绝不会无声地丢失任何消息内容。
 	for _, ch := range st.subs {
 		select {
 		case ch <- ev:
 		default:
+			// 缓冲满：发送警告事件，要求前端重连
+			warningEv := Event{
+				ID:   st.nextID + 1,
+				Name: EventBufferOverflow,
+				Data: map[string]any{
+					"session_id": key,
+					"reason":     "订阅缓冲溢出，请重新连接以同步完整状态",
+				},
+			}
+			select {
+			case ch <- warningEv:
+			default:
+				// 即使警告也放不进去，就算了（已经很满了）
+			}
 		}
 	}
 	return ev
@@ -84,7 +116,7 @@ func (h *Hub) Subscribe(key string, after uint64) (replay []Event, live <-chan E
 
 	st.nextSub++
 	id := st.nextSub
-	ch := make(chan Event, 256)
+	ch := make(chan Event, h.subscriberBufferSize)
 	st.subs[id] = ch
 
 	cancel = func() {

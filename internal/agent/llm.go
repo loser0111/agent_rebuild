@@ -196,6 +196,7 @@ func (l *LLMRunner) stream(ctx context.Context, rreq Request, out chan<- Event) 
 	}
 
 	url := endpointURL(l.BaseURL, "chat/completions")
+	dumpRequest(ctx, "openai", url, l.Model, raw, len(body.Messages))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return fmt.Errorf("创建请求失败: %w", err)

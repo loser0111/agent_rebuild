@@ -176,6 +176,7 @@ func (a *AnthropicRunner) stream(ctx context.Context, rreq Request, out chan<- E
 	}
 
 	url := endpointURL(a.BaseURL, "messages")
+	dumpRequest(ctx, "anthropic", url, a.Model, raw, len(body.Messages))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		return fmt.Errorf("创建请求失败: %w", err)
