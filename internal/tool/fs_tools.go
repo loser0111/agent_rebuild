@@ -23,6 +23,16 @@ import (
 	"strings"
 )
 
+// allowOutOfBoundsPaths 是一个调试/测试开关，允许突破工作目录限制。
+//
+// 用于：
+//   - 跨项目调研（访问兄弟目录的文件）
+//   - 集成测试（不受工作目录约束）
+//
+// 生产环境应保持关闭（默认行为）。
+// 打开方式：设置环境变量 TOOL_ALLOW_OUT_OF_BOUNDS_PATHS=true
+var allowOutOfBoundsPaths = os.Getenv("TOOL_ALLOW_OUT_OF_BOUNDS_PATHS") == "true"
+
 // 输出上限（字符数）。超过会截断并提示模型。
 const (
 	maxReadChars    = 30000
@@ -52,6 +62,10 @@ type fsConfig struct {
 }
 
 // resolve 把用户给的相对路径解析为绝对路径，并确保不越界。
+//
+// 默认情况下，所有路径都限制在工作目录 (workspace) 内。
+// 若设置了 TOOL_ALLOW_OUT_OF_BOUNDS_PATHS=true，可以访问工作目录外的文件，
+// 但仍然防止访问系统关键目录（如 /etc/ 等）。
 func (c fsConfig) resolve(p string) (string, error) {
 	p = strings.TrimSpace(p)
 	if p == "" {
@@ -73,9 +87,22 @@ func (c fsConfig) resolve(p string) (string, error) {
 	// 防越界：解析后的路径必须仍在 root 下。
 	// 用 EvalSymlinks 前先做前缀检查（符号链接可能指向外部，见下方说明）。
 	rel, err := filepath.Rel(root, abs)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("路径 %q 超出工作目录 %q 的范围", p, root)
+	isOutOfBounds := err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator))
+
+	if isOutOfBounds {
+		if !allowOutOfBoundsPaths {
+			return "", fmt.Errorf("路径 %q 超出工作目录 %q 的范围", p, root)
+		}
+
+		// 即使允许突破，也要防止访问系统关键目录
+		blockedPrefixes := []string{"/etc/", "/sys/", "/var/", "/proc/", "C:\\Windows\\", "C:\\Program Files\\"}
+		for _, prefix := range blockedPrefixes {
+			if strings.HasPrefix(abs, prefix) || strings.HasPrefix(abs, strings.ToLower(prefix)) {
+				return "", fmt.Errorf("出于安全考虑，禁止访问系统目录: %s", p)
+			}
+		}
 	}
+
 	return abs, nil
 }
 
