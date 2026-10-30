@@ -53,6 +53,9 @@ type ToolCall struct {
 	Risk tool.Risk
 	// RequiresApproval 是否需要人工确认后才执行。
 	RequiresApproval bool
+	// Target 代理调用实际要执行的目标（如 search_router 代理的 "github/create_issue"）；
+	// 非代理调用为空。只用于审批展示（ModelApprover 的裁决提示），不落库。
+	Target string
 }
 
 // ToolResult 工具执行结果。

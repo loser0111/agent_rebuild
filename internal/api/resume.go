@@ -256,7 +256,7 @@ func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
 				// 从未调用 registry.Invoke。批准之后必须真正执行并把
 				// 真实结果喂给模型，不能用"已批准"这几个字充数，
 				// 否则模型会以为文件已经写好，但实际上什么都没发生。
-				result := loop.ExecuteApproved(ctx, s.tools, s.cfg.ToolTimeout, callID, p.Name, p.Args)
+				result := loop.ExecuteApproved(ctx, s.Tools(), s.cfg.ToolTimeout, callID, p.Name, p.Args)
 				content = result.Output
 				if result.IsError {
 					status = session.StatusError

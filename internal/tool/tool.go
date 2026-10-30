@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -89,6 +90,20 @@ type Tool interface {
 	Execute(ctx context.Context, args json.RawMessage) (Result, error)
 }
 
+// CallResolver 是可选能力：工具的风险等级取决于**这次调用的参数**。
+//
+// 典型实现是代理工具 search_router（见 docs/17-mcp-client.md 12.5）：
+// 它自己的 Spec().Risk 没有意义——list / search 是只读的，execute 的风险
+// 取决于被代理的目标工具。若只按工具名定级，要么把 execute 一个删库工具
+// 当成安全操作直接放行（绕过整个审批体系），要么连 list 都要人工点批准。
+//
+// loop 在定级时先检查工具是否实现了本接口，实现了就以 ResolveCall 为准。
+type CallResolver interface {
+	// ResolveCall 返回这次调用实际要执行的目标（展示用；空串表示这次不是代理执行）
+	// 及其风险等级。必须是纯函数、不能有副作用：它在审批之前被调用。
+	ResolveCall(args json.RawMessage) (target string, risk Risk)
+}
+
 // Registry 是工具注册表。
 type Registry struct {
 	mu    sync.RWMutex
@@ -134,6 +149,47 @@ func (r *Registry) Register(tools ...Tool) {
 		r.tools[name] = t
 		r.order = append(r.order, name)
 	}
+}
+
+// With 返回一个新的注册表：包含 r 的全部工具（保持原顺序），再追加 extra。
+//
+// 用于「内置工具 + 一批运行时才知道的外部工具（MCP）」的合并：
+// 每次外部工具变化都从内置工具重新组一个新 Registry，然后原子替换给
+// executor（见 docs/17-mcp-client.md 第 2 节），r 本身不被修改。
+//
+// 与 Register 的关键区别：extra 中重名/空名的工具**跳过并告警**，而不是 panic。
+// Register 的 panic 针对的是「内置工具写重了」这种编程错误，应该在启动时
+// 暴露；extra 来自外部进程的自报，外部输入不该能把整个服务打崩。
+//
+// 工具实例在新旧 Registry 之间共享：内置工具无可变状态，MCP 工具的状态
+// 在它背后的连接里，共享不会产生额外问题。
+func (r *Registry) With(extra ...Tool) *Registry {
+	r.mu.RLock()
+	out := &Registry{
+		tools: make(map[string]Tool, len(r.tools)+len(extra)),
+		order: make([]string, 0, len(r.order)+len(extra)),
+		root:  r.root,
+	}
+	for _, name := range r.order {
+		out.tools[name] = r.tools[name]
+		out.order = append(out.order, name)
+	}
+	r.mu.RUnlock()
+
+	for _, t := range extra {
+		name := t.Spec().Name
+		if name == "" {
+			slog.Warn("tool: 跳过空名工具")
+			continue
+		}
+		if _, exists := out.tools[name]; exists {
+			slog.Warn("tool: 跳过重名工具", "name", name)
+			continue
+		}
+		out.tools[name] = t
+		out.order = append(out.order, name)
+	}
+	return out
 }
 
 // Get 按名取工具。

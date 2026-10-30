@@ -65,6 +65,15 @@ func (s *Server) routes() http.Handler {
 	mux.HandleFunc("GET /api/tools", s.handleListTools)
 	mux.HandleFunc("/api/tools", methodNotAllowed("GET"))
 
+	// MCP server 状态与手动重启（见 docs/17-mcp-client.md 第 8 节）
+	mux.HandleFunc("GET /api/mcp/servers", s.handleListMCPServers)
+	mux.HandleFunc("/api/mcp/servers", methodNotAllowed("GET"))
+	mux.HandleFunc("POST /api/mcp/servers/{name}/restart", s.handleRestartMCPServer)
+	mux.HandleFunc("/api/mcp/servers/{name}/restart", methodNotAllowed("POST"))
+	// 自定义工具的风险等级 / 开关（见 docs/17-mcp-client.md 第 5、8 节）
+	mux.HandleFunc("PUT /api/tool-overrides", s.handleSetToolOverride)
+	mux.HandleFunc("/api/tool-overrides", methodNotAllowed("PUT"))
+
 	// 审批模式：查询当前生效模式 / 运行时切换（manual|model|auto），
 	// 无需重启进程（见 Server.SetApprovalMode 注释）。
 	mux.HandleFunc("GET /api/approval-mode", s.handleGetApprovalMode)

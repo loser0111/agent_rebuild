@@ -29,7 +29,7 @@ var ErrSchemaTooNew = errors.New("sqlite: 数据库 schema 版本高于当前程
 
 // schemaVersion 是当前程序实现的 schema 版本。
 // 每次改动表结构时 +1，并在 migrate 里追加迁移步骤。
-const schemaVersion = 3
+const schemaVersion = 4
 
 // Open 打开（或创建）数据库并完成初始化。
 //
@@ -152,6 +152,7 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		{version: 1, sql: schemaV1},
 		{version: 2, sql: schemaV2},
 		{version: 3, sql: schemaV3},
+		{version: 4, sql: schemaV4},
 	}
 
 	for _, step := range steps {
@@ -307,4 +308,22 @@ ALTER TABLE sessions ADD COLUMN workspace_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE sessions ADD COLUMN approval_mode TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS idx_sessions_workspace
     ON sessions(workspace_id);
+`
+
+// schemaV4 新增自定义工具（MCP）的前端覆盖设置（见 docs/17-mcp-client.md 第 5 节）。
+//
+// 设计要点：
+//   - 键是 "server/原始名"，不引用任何其他表：覆盖可以先于工具存在
+//     （server 还没连上就先关掉某个工具），也不因 server 下线而被清掉。
+//   - 只存用户改过的字段：risk 为空串 / enabled 为 NULL 表示「跟随 mcp.json」；
+//     两者都跟随时整行删除，不留空壳。
+//   - enabled 用可空整数而不是 NOT NULL DEFAULT 1：「用户明确打开」和「没设置」
+//     语义不同——前者在 mcp.json 关掉该工具时仍然生效。
+const schemaV4 = `
+CREATE TABLE IF NOT EXISTS tool_overrides (
+    tool       TEXT PRIMARY KEY,
+    risk       TEXT NOT NULL DEFAULT '',
+    enabled    INTEGER,
+    updated_at INTEGER NOT NULL
+);
 `

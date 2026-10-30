@@ -26,6 +26,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"agent_rebuild/internal/agent"
@@ -192,7 +193,13 @@ type Executor struct {
 	approverResolver ApproverResolver
 
 	// 工具系统（nil 表示不启用）。
-	registry     *tool.Registry
+	//
+	// registry 用 atomic.Pointer 而不是受 mu 保护的普通字段：MCP server
+	// 异步连上、中途断开、发 tools/list_changed 都会触发运行中整体替换
+	// （见 docs/17-mcp-client.md 第 2 节）。原先 streamEvents 对它是无锁读，
+	// 一旦有运行时写入就是真实的数据竞争。原子指针让「整体换一批工具」
+	// 在语言层面就不可能读到半新半旧的状态，读路径也不用抢 mu。
+	registry     atomic.Pointer[tool.Registry]
 	systemPrompt string
 	maxSteps     int
 	toolTimeout  time.Duration
@@ -332,11 +339,12 @@ func (e *Executor) Shutdown(ctx context.Context) error {
 
 // SetTools 启用工具系统。
 //
-// 必须在 Start 之前调用（并发安全：内部有锁）。
+// 一般在 Start 之前调用一次（并发安全：内部有锁）。运行中只想换工具集
+// 时用 SetRegistry，不要重复调用本方法——它会把工具使用准则再拼一遍。
 func (e *Executor) SetTools(registry *tool.Registry, systemPrompt string, maxSteps int, timeout time.Duration, approver loop.Approver) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.registry = registry
+	e.registry.Store(registry)
 	// 追加工具使用准则：模型（尤其小模型）拿到工具后极易反复试探同一个
 	// 文件、把 12 轮步数耗尽，最后什么结论都给不出。显式约束能显著减少
 	// 无效往返。
@@ -344,6 +352,21 @@ func (e *Executor) SetTools(registry *tool.Registry, systemPrompt string, maxSte
 	e.maxSteps = maxSteps
 	e.toolTimeout = timeout
 	e.approver = approver
+}
+
+// SetRegistry 运行时整体替换工具集（MCP 工具上线/下线时调用）。
+//
+// 只换工具，不动系统提示/步数/超时/审批器：理由同 SetApprover。
+// 生效范围：之后**新开始**的执行。已经在跑的那一轮在 streamEvents 开头
+// 拿了快照，会用旧工具集跑完——一轮 ReAct 中途换工具会让「模型看到的
+// 工具声明」和「实际可调用的工具」对不上，宁可让新工具晚一轮生效。
+func (e *Executor) SetRegistry(registry *tool.Registry) {
+	e.registry.Store(registry)
+}
+
+// Registry 返回当前生效的工具集快照（可能为 nil）。
+func (e *Executor) Registry() *tool.Registry {
+	return e.registry.Load()
 }
 
 // SetCheckpointer 注入断点存储，启用「等待用户回答」能力。
@@ -395,6 +418,10 @@ func withToolGuidance(base string) string {
 		"5. 单个问题通常 3-5 次工具调用内就能回答；接近上限仍无结论时，",
 		"   应基于已有信息作答并说明还缺什么。",
 		"6. 工具报错时先读错误信息调整参数，不要用相同参数重试。",
+		// 固定措辞、不随外部工具变化（不破坏缓存）；有没有 search_router 由工具列表本身体现。
+		// 见 docs/17-mcp-client.md 12.2：模型不知道某类能力存在就不会去搜。
+		"7. 如果有 search_router 工具：内置工具做不到的事（外部系统、数据库、公司内部服务等），",
+		"   先用它 search 查找自定义工具，不要直接回答做不到。",
 	}, "\n")
 
 	base = strings.TrimSpace(base)
@@ -732,7 +759,9 @@ func (e *Executor) streamEvents(
 	out := make(chan agent.Event, 16)
 	done := make(chan struct{})
 
-	if e.registry == nil || e.registry.Len() == 0 {
+	// 整轮只读这一次：之后判空、传给 loop 都用同一份快照（见 SetRegistry）。
+	registry := e.registry.Load()
+	if registry == nil || registry.Len() == 0 {
 		// 无工具：直接转发 Runner 事件。
 		go func() {
 			defer close(done)
@@ -775,7 +804,7 @@ func (e *Executor) streamEvents(
 		}
 
 		lp := loop.New(runner, loop.Config{
-			Registry:     e.registry,
+			Registry:     registry,
 			SystemPrompt: e.systemPrompt,
 			MaxSteps:     e.maxSteps,
 			ToolTimeout:  e.toolTimeout,

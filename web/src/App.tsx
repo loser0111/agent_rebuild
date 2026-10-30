@@ -9,6 +9,7 @@ import { Composer } from './components/Composer'
 import { StatusBar } from './components/StatusBar'
 import { ModelManager } from './components/ModelManager'
 import { WorkspaceManager } from './components/WorkspaceManager'
+import { McpPanel } from './components/McpPanel'
 import { SessionSettingsDialog } from './components/SessionSettingsDialog'
 
 /** 桌面壳注入的窗口控制接口（仅 Electron 下存在）。 */
@@ -64,6 +65,7 @@ function Shell({ desktop }: { desktop: boolean }) {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [modelManagerOpen, setModelManagerOpen] = useState(false)
   const [workspaceManagerOpen, setWorkspaceManagerOpen] = useState(false)
+  const [mcpPanelOpen, setMcpPanelOpen] = useState(false)
   const [sessionSettingsOpen, setSessionSettingsOpen] = useState(false)
 
   const current = sessions.find((s) => s.id === currentId)
@@ -143,6 +145,16 @@ function Shell({ desktop }: { desktop: boolean }) {
             >
               📁
             </button>
+            {/* MCP 外部工具服务状态（见 docs/17-mcp-client.md） */}
+            <button
+              className="icon-btn"
+              type="button"
+              onClick={() => setMcpPanelOpen(true)}
+              title="MCP 服务"
+              aria-label="MCP 服务"
+            >
+              🔌
+            </button>
             {/* 窗口右上角的模型配置入口 */}
             <button
               className="icon-btn"
@@ -177,6 +189,7 @@ function Shell({ desktop }: { desktop: boolean }) {
 
       <ModelManager open={modelManagerOpen} onClose={() => setModelManagerOpen(false)} />
       <WorkspaceManager open={workspaceManagerOpen} onClose={() => setWorkspaceManagerOpen(false)} />
+      <McpPanel open={mcpPanelOpen} onClose={() => setMcpPanelOpen(false)} />
       <SessionSettingsDialog
         open={sessionSettingsOpen}
         onClose={() => setSessionSettingsOpen(false)}

@@ -7,6 +7,8 @@ import type {
   CreateSessionResponse,
   HealthResponse,
   ListSessionsResponse,
+  McpServersResponse,
+  ToolOverrideInput,
   ModelConfig,
   ModelConfigInput,
   ModelConfigListResponse,
@@ -178,6 +180,18 @@ export const api = {
     request<Workspace>(`/workspaces/${id}`, { method: 'PUT', body: JSON.stringify(input) }),
 
   deleteWorkspace: (id: string) => request<void>(`/workspaces/${id}`, { method: 'DELETE' }),
+
+  /* ---- MCP server 状态（见 docs/17-mcp-client.md） ---- */
+
+  listMcpServers: () => request<McpServersResponse>('/mcp/servers'),
+
+  /** 保存一个自定义工具的风险等级 / 开关；返回最新的面板数据。 */
+  setToolOverride: (input: ToolOverrideInput) =>
+    request<McpServersResponse>('/tool-overrides', { method: 'PUT', body: JSON.stringify(input) }),
+
+  /** 让 server 立即重连；只发信号，结果通过继续轮询 listMcpServers 观察。 */
+  restartMcpServer: (name: string) =>
+    request<{ ok: boolean }>(`/mcp/servers/${encodeURIComponent(name)}/restart`, { method: 'POST' }),
 
   /* ---- 审批模式（运行时切换，见 docs/12-approval-modes.md） ---- */
 

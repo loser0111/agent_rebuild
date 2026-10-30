@@ -20,10 +20,13 @@ import (
 	"agent_rebuild/internal/agent"
 	"agent_rebuild/internal/api"
 	"agent_rebuild/internal/config"
+	"agent_rebuild/internal/customtools"
 	"agent_rebuild/internal/modelconfig"
 	"agent_rebuild/internal/session"
 	"agent_rebuild/internal/storage/sqlite"
 	"agent_rebuild/internal/tool"
+	"agent_rebuild/internal/tool/mcp"
+	"agent_rebuild/internal/tool/router"
 	"agent_rebuild/internal/workspace"
 )
 
@@ -62,7 +65,7 @@ func run() error {
 		}
 	}
 
-	store, checkpoints, runner, models, workspaces, closer, err := buildDataLayer(cfg)
+	store, checkpoints, runner, models, workspaces, toolOverrides, closer, err := buildDataLayer(cfg)
 	if err != nil {
 		return err
 	}
@@ -96,6 +99,8 @@ func run() error {
 		EnableCommand: cfg.EnableCommandTool,
 	})
 	srv.SetTools(registry, cfg.SystemPrompt, cfg.MaxToolSteps, cfg.ToolTimeout)
+	// MCP：后台连接外部 server，工具就绪后原子替换进 Registry（不阻塞启动）。
+	mcpManager := setupMCP(cfg, registry, srv, toolOverrides)
 	// 断点存储：让 ask_user 能挂起等待回答（nil 表示不支持，自动降级）。
 	srv.SetCheckpointer(checkpoints)
 	// 注入模型配置存储 + Runner 重建器（支持运行时多模型切换）。
@@ -134,6 +139,15 @@ func run() error {
 	// ctx 在收到 SIGINT/SIGTERM 时取消。
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if mcpManager != nil {
+		// 用独立的 context 而不是 ctx：收到退出信号时不能让 server 先死，
+		// 否则正在收尾的对话里的工具调用会全部失败；关闭时机由下面的 Close 控制。
+		mcpManager.Start(context.Background())
+		// defer 而非只在末尾显式调用：HTTP 异常退出 / 优雅关闭失败两条提前 return
+		// 的路径也必须收掉子进程。defer 在函数返回时执行，正常路径下晚于 srv.Wait()，
+		// 即在途对话收尾之后；且先于数据库关闭（defer 后进先出）。
+		defer mcpManager.Close()
+	}
 
 	// 父进程守护：桌面壳（Electron）以 --parent-pid=<pid> 启动本进程，
 	// 若父进程被强制终止（来不及发信号），本进程会自行退出，
@@ -187,29 +201,30 @@ func run() error {
 //
 // 返回值 closer 用于在进程退出时释放资源（关闭数据库）。
 // 忘记调用它会丢数据：SQLite 的 WAL 需要 checkpoint 才能合并到主库。
-func buildDataLayer(cfg *config.Config) (session.Store, session.CheckpointStore, agent.Runner, modelconfig.Store, workspace.Store, func() error, error) {
+func buildDataLayer(cfg *config.Config) (session.Store, session.CheckpointStore, agent.Runner, modelconfig.Store, workspace.Store, customtools.Store, func() error, error) {
 	switch cfg.StoreDriver {
 	case "memory", "":
 		// 内存模式：不支持持久化模型配置、workspace，退化为环境变量配置
 		// （会话绑定 workspace 的功能在这种驱动下不可用，见 Server.requireWorkspaces）。
 		runner, err := buildRunnerFromConfig(cfg)
 		if err != nil {
-			return nil, nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, nil, err
 		}
 		slog.Warn("使用内存存储：重启后会话、模型配置与 workspace 都会丢失")
 		// 内存模式没有 checkpoint：进程重启即丢，断点无从恢复，
 		// 返回 nil 让 ask_user 走「无法提问」的降级分支。
-		return session.NewMemoryStore(cfg.MaxMessagesPerSession), nil, runner, nil, nil, nil, nil
+		// 自定义工具设置同理不支持保存（返回无类型 nil：*SQLStore(nil) 装进接口不等于 nil）。
+		return session.NewMemoryStore(cfg.MaxMessagesPerSession), nil, runner, nil, nil, nil, nil, nil
 
 	case "sqlite":
 		dataDir, err := config.ResolveDataDir(cfg.DataDir)
 		if err != nil {
-			return nil, nil, nil, nil, nil, nil, fmt.Errorf("解析数据目录失败: %w", err)
+			return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf("解析数据目录失败: %w", err)
 		}
 		dbPath := config.DBPath(dataDir)
 		db, err := sqlite.Open(dbPath)
 		if err != nil {
-			return nil, nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, nil, err
 		}
 		slog.Info("SQLite 已就绪", "path", dbPath, "data_dir", dataDir)
 
@@ -218,18 +233,20 @@ func buildDataLayer(cfg *config.Config) (session.Store, session.CheckpointStore,
 		models := modelconfig.NewSQLStore(db.SQL(), dataDir)
 		// workspace 不涉及密钥，直接复用同一个 *sql.DB。
 		workspaces := workspace.NewSQLStore(db.SQL())
+		// 自定义工具（MCP）的风险等级 / 开关设置（schema v4，见 docs/17 第 5 节）。
+		overrides := customtools.NewSQLStore(db.SQL())
 
 		runner, err := resolveRunner(cfg, models)
 		if err != nil {
 			_ = db.Close()
-			return nil, nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, nil, nil, err
 		}
 		return sqlite.NewSessionStore(db, cfg.MaxMessagesPerSession),
 			sqlite.NewCheckpointStore(db),
-			runner, models, workspaces, db.Close, nil
+			runner, models, workspaces, overrides, db.Close, nil
 
 	default:
-		return nil, nil, nil, nil, nil, nil, fmt.Errorf(
+		return nil, nil, nil, nil, nil, nil, nil, fmt.Errorf(
 			"不支持的 STORE_DRIVER=%q（可选 memory / sqlite）", cfg.StoreDriver)
 	}
 }
@@ -321,4 +338,60 @@ func setupLogger(level string) {
 	}
 	h := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: lv})
 	slog.SetDefault(slog.New(h))
+}
+
+// setupMCP 读取 MCP 配置，创建 Manager 与自定义工具服务（不启动，见 run 里的 Start）。
+//
+// 返回 nil 表示 MCP 被总开关关闭；没有任何配置文件时仍返回一个空 Manager，
+// 这样前端面板能告诉用户「配置文件应该放在哪」，而不是只显示「未启用」。
+//
+// 工具三分类（docs/17 第 12 节）在这里落地：builtin 是 meta 工具，永远原生暴露；
+// MCP 工具不原生暴露，由 customtools 组装成代理工具 search_router 追加在 builtin 之后。
+func setupMCP(cfg *config.Config, builtin *tool.Registry, srv *api.Server, overrides customtools.Store) *mcp.Manager {
+	if !cfg.MCPEnabled {
+		slog.Info("MCP 已关闭（MCP_ENABLED=false）")
+		return nil
+	}
+	// 用户级配置放在数据目录；memory 驱动下也照样解析（不依赖数据库）。
+	dataDir := ""
+	if d, err := config.ResolveDataDir(cfg.DataDir); err == nil {
+		dataDir = d
+	} else {
+		slog.Warn("解析数据目录失败，跳过用户级 MCP 配置", "err", err)
+	}
+	// 不叫 workspace：会遮蔽同名的 internal/workspace 包。
+	wsRoot := builtin.WorkspaceRoot()
+	paths := mcp.DefaultConfigPaths(cfg.MCPConfigPaths, dataDir, wsRoot, cfg.MCPLoadProjectConfig)
+	servers, warnings := mcp.LoadFiles(paths, os.LookupEnv)
+	for _, w := range warnings {
+		slog.Warn("MCP 配置问题", "err", w)
+	}
+	for _, sc := range servers {
+		if sc.Err != nil {
+			slog.Warn("MCP server 配置无效", "server", sc.Name, "source", sc.Source, "err", sc.Err)
+		}
+	}
+	slog.Info("MCP 配置已加载", "paths", paths, "servers", len(servers))
+
+	// ct 在 Manager 之后创建，但 OnChange 只会在 Start 之后触发，那时 ct 已赋值。
+	var ct *customtools.Service
+	m := mcp.NewManager(mcp.Options{
+		Servers:     servers,
+		ConfigPaths: paths,
+		Workspace:   wsRoot,
+		OnChange:    func() { ct.Rebuild() },
+	})
+	ct = customtools.New(customtools.Options{
+		Builtin: builtin,
+		Source:  m,
+		Store:   overrides,
+		// 每次从内置工具重新组一个新 Registry 再整体替换（见 docs/17 第 2 节）：
+		// builtin 本身从不被修改。
+		Apply:  srv.ReplaceTools,
+		Router: router.Options{CatalogBudget: cfg.MCPCatalogBudget},
+	})
+	// 启动前先建一次：search_router 立刻出现，目录里的 server 标为「正在连接」。
+	ct.Rebuild()
+	srv.SetMCP(m, ct)
+	return m
 }

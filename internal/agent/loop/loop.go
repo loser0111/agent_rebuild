@@ -287,7 +287,7 @@ func (l *Loop) Run(ctx context.Context, history []session.Message, out chan<- ag
 				if ev.ToolCall != nil {
 					call := *ev.ToolCall
 					// 补充风险信息供审批与 UI 使用。
-					call.Risk, call.RequiresApproval = l.riskOf(call.Name)
+					call.Risk, call.RequiresApproval, call.Target = l.riskOf(call.Name, call.Args)
 					// 未知工具直接给出明确错误，避免被审批器误判为"危险操作"。
 					if l.cfg.Registry != nil {
 						if _, ok := l.cfg.Registry.Get(call.Name); !ok {
@@ -907,20 +907,29 @@ func (l *Loop) suspend(ctx context.Context, call agent.ToolCall, start time.Time
 	return result
 }
 
-// riskOf 查询工具的危险等级。
+// riskOf 查询一次调用的危险等级、是否需要审批，以及代理调用的真实目标。
+//
 // 未知工具返回 (RiskDangerous, false)：虽然按危险等级归类，
 // 但**不需要审批**——它会直接执行失败并返回「工具不存在」，
 // 否则用户会看到莫名其妙的「需要确认执行命令」提示。
-func (l *Loop) riskOf(name string) (tool.Risk, bool) {
+//
+// 工具实现了 tool.CallResolver（代理工具 search_router）时按参数定级：
+// execute 一个高危的自定义工具必须走审批，list / search 则直接执行
+// （见 docs/17-mcp-client.md 12.5）。
+func (l *Loop) riskOf(name, args string) (risk tool.Risk, requiresApproval bool, target string) {
 	if l.cfg.Registry == nil {
-		return tool.RiskSafe, false
+		return tool.RiskSafe, false, ""
 	}
 	t, ok := l.cfg.Registry.Get(name)
 	if !ok {
-		return tool.RiskDangerous, false
+		return tool.RiskDangerous, false, ""
 	}
-	risk := t.Spec().Risk
-	return risk, risk.RequiresApproval()
+	if cr, ok := t.(tool.CallResolver); ok {
+		target, risk = cr.ResolveCall(json.RawMessage(args))
+		return risk, risk.RequiresApproval(), target
+	}
+	risk = t.Spec().Risk
+	return risk, risk.RequiresApproval(), ""
 }
 
 func (l *Loop) toolSpecs() []tool.Spec {

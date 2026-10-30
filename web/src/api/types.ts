@@ -366,3 +366,63 @@ export interface ApprovalModeResponse {
   /** 工具系统未启用时为 false——没有工具就没有审批，前端应隐藏切换控件。 */
   tools_enabled: boolean
 }
+
+/* ---- MCP server 状态（见 docs/17-mcp-client.md 第 8 节） ---- */
+
+/** 与后端 mcp.Status 对齐。 */
+export type McpStatus = 'connecting' | 'ready' | 'retrying' | 'failed' | 'disabled'
+
+/** 一个自定义工具（MCP）的设置：基础值 / 用户覆盖 / 生效值（见 docs/17 第 5 节）。 */
+export interface McpToolView {
+  /** 全名：server/原始名，也是 search_router 里用的名字 */
+  name: string
+  original_name: string
+  title?: string
+  description: string
+  /** mcp.json / annotations 算出的值 */
+  base_risk: ToolRisk
+  base_enabled: boolean
+  /** 用户在面板里的设置：空串 / null 表示跟随基础值 */
+  override_risk: ToolRisk | ''
+  override_enabled: boolean | null
+  /** 最终生效值 */
+  risk: ToolRisk
+  enabled: boolean
+}
+
+export interface McpServerStatus {
+  name: string
+  /** 来自哪个配置文件 */
+  source: string
+  description?: string
+  command?: string
+  status: McpStatus
+  last_error?: string
+  server_name?: string
+  server_version?: string
+  protocol_version?: string
+  tool_count: number
+  tools: McpToolView[]
+  restarts: number
+  connected_at?: string
+  /** false：disabled 或配置无效，重启无意义 */
+  restartable: boolean
+}
+
+/** PUT /api/tool-overrides 的请求体：risk 为空 / enabled 为 null 表示恢复默认 */
+export interface ToolOverrideInput {
+  tool: string
+  risk: ToolRisk | ''
+  enabled: boolean | null
+}
+
+/** GET /api/mcp/servers */
+export interface McpServersResponse {
+  /** false 表示 MCP_ENABLED=false */
+  enabled: boolean
+  /** false 表示当前存储不能保存工具设置（memory 驱动），面板只读 */
+  overrides_supported: boolean
+  /** 读取过的配置文件路径；没有任何 server 时用于提示「把配置放在哪」 */
+  config_paths: string[]
+  servers: McpServerStatus[]
+}

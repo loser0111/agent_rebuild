@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useChat } from '../state/chatStore'
 import { findDuplicateExecutedCall } from '../state/toolRestore'
+import { parseProxyCall } from '../lib/proxyCall'
 
 /** 参数 JSON 美化；解析失败原样显示（模型可能产出不完整的 JSON）。 */
 function prettyArgs(raw: string | undefined): string {
@@ -87,10 +88,13 @@ export function ApprovalCard() {
         // 同名同参数、但不是自己的调用：提示用户"这可能是模型重复发起的操作"。
         // 纯提示，不拦截——参数相同不代表这次一定不该批准。
         const duplicate = findDuplicateExecutedCall(p.toolName, p.toolArgs, p.callId, toolCalls)
+        // 代理调用：审批的对象是被代理的自定义工具，标题和参数都展示它（风险等级后端已按它定级）。
+        const proxy = parseProxyCall(p.toolName ?? '', p.toolArgs ?? '')
         return (
           <div className="approval-item" key={p.callId}>
             <div className="approval-item-head">
-              <span className="tool-name">{p.toolName || '工具'}</span>
+              <span className="tool-name">{proxy?.target ?? (p.toolName || '工具')}</span>
+              {proxy?.target && <span className="tool-proxy-target">自定义工具 · 经 search_router</span>}
               {p.risk === 'dangerous' && <span className="tool-badge is-danger">高危</span>}
               {p.risk === 'moderate' && <span className="tool-badge is-warn">写操作</span>}
               {decision === 'approve' && <span className="approval-decided is-approve">已批准</span>}
@@ -105,7 +109,7 @@ export function ApprovalCard() {
               </div>
             )}
 
-            <pre className="tool-pre">{prettyArgs(p.toolArgs)}</pre>
+            <pre className="tool-pre">{proxy ? proxy.args : prettyArgs(p.toolArgs)}</pre>
 
             {isDenying ? (
               <div className="approval-deny-box">

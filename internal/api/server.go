@@ -10,16 +10,19 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"agent_rebuild/internal/agent"
 	"agent_rebuild/internal/agent/loop"
 	"agent_rebuild/internal/config"
+	"agent_rebuild/internal/customtools"
 	"agent_rebuild/internal/executor"
 	"agent_rebuild/internal/modelconfig"
 	"agent_rebuild/internal/session"
 	"agent_rebuild/internal/sse"
 	"agent_rebuild/internal/tool"
+	"agent_rebuild/internal/tool/mcp"
 	"agent_rebuild/internal/workspace"
 )
 
@@ -43,7 +46,16 @@ type Server struct {
 	// rebuildRunner 根据配置重建 Runner（运行时切换模型用）。
 	rebuildRunner func(*modelconfig.Config) (agent.Runner, error)
 	// tools 工具注册表（nil 表示未启用）。
-	tools *tool.Registry
+	//
+	// 原子指针而非普通字段：MCP 工具上线/下线时会在运行中被 ReplaceTools
+	// 整体替换，而 /resume、/api/tools 等 handler 会并发读它
+	// （见 docs/17-mcp-client.md 第 2 节）。
+	tools atomic.Pointer[tool.Registry]
+	// mcp MCP server 管理器（nil 表示 MCP 未启用），供 /api/mcp/* 查询状态。
+	// 启动阶段 SetMCP 写一次、之后只读，与 models/workspaces 同样的约定。
+	mcp *mcp.Manager
+	// customTools 自定义工具的用户设置与 search_router 组装（nil 表示 MCP 未启用）。
+	customTools *customtools.Service
 	// checkpoints 断点存储（nil 表示不支持挂起等待回答）。
 	checkpoints session.CheckpointStore
 
@@ -95,7 +107,7 @@ func (s *Server) SetTools(registry *tool.Registry, systemPrompt string, maxSteps
 		}
 		return s.buildApprover(normalized), nil
 	})
-	s.tools = registry
+	s.tools.Store(registry)
 	s.approvalMu.Lock()
 	s.approvalMode = s.cfg.ApprovalMode
 	s.approvalMu.Unlock()
@@ -145,14 +157,14 @@ func (s *Server) ApprovalMode() config.ApprovalMode {
 // 不会被这次切换影响；只有"切换之后新发起的" evaluateApprovals 才会
 // 看到新的 Approver。
 //
-// 要求工具系统已启用（s.tools != nil），否则没有 Approver 可言，
+// 要求工具系统已启用（s.Tools() != nil），否则没有 Approver 可言，
 // 返回明确错误而不是静默忽略。
 func (s *Server) SetApprovalMode(mode config.ApprovalMode) error {
 	normalized, err := config.NormalizeApprovalMode(string(mode))
 	if err != nil {
 		return err
 	}
-	if s.tools == nil {
+	if s.Tools() == nil {
 		return fmt.Errorf("工具系统未启用，无法设置审批模式")
 	}
 	approver := s.buildApprover(normalized)
@@ -163,8 +175,29 @@ func (s *Server) SetApprovalMode(mode config.ApprovalMode) error {
 	return nil
 }
 
-// Tools 返回当前工具注册表（可为 nil）。
-func (s *Server) Tools() *tool.Registry { return s.tools }
+// Tools 返回当前工具注册表快照（可为 nil）。
+func (s *Server) Tools() *tool.Registry { return s.tools.Load() }
+
+// ReplaceTools 运行时整体替换工具集（MCP 工具变化时由 main.go 调用）。
+//
+// 只在工具系统已经通过 SetTools 启用之后才生效：没有 SetTools 就没有
+// 审批器与系统提示，单独塞一个 Registry 进去反而会造成"有工具却没有
+// 审批"的半配置状态，宁可忽略并告警。
+//
+// Server 与 Executor 各存一份指针，两次 Store 之间有一个极短的窗口两边
+// 不一致：只影响 /api/tools 展示与 /resume 批准执行用哪份，二者对同名工具
+// 的行为相同；工具已消失的情况由 Registry.Invoke 返回「工具不存在」兜底。
+func (s *Server) ReplaceTools(registry *tool.Registry) {
+	if registry == nil {
+		return
+	}
+	if s.Tools() == nil {
+		slog.Warn("工具系统未启用，忽略工具集替换")
+		return
+	}
+	s.exec.SetRegistry(registry)
+	s.tools.Store(registry)
+}
 
 // SetCheckpointer 注入断点存储，启用「等待用户回答」能力。
 //
@@ -177,7 +210,8 @@ func (s *Server) SetCheckpointer(cp session.CheckpointStore) {
 
 // handleListTools 列出可用工具（供前端展示与调试）。
 func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
-	if s.tools == nil {
+	registry := s.Tools()
+	if registry == nil {
 		respondJSON(w, r, http.StatusOK, map[string]any{"tools": []any{}})
 		return
 	}
@@ -188,7 +222,7 @@ func (s *Server) handleListTools(w http.ResponseWriter, r *http.Request) {
 		// RequiresApproval 是否需要用户确认。
 		RequiresApproval bool `json:"requires_approval"`
 	}
-	specs := s.tools.Specs()
+	specs := registry.Specs()
 	out := make([]toolInfo, 0, len(specs))
 	for _, sp := range specs {
 		out = append(out, toolInfo{

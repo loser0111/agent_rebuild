@@ -2547,3 +2547,123 @@ textarea.text-input {
     max-width: 150px;
   }
 }
+
+/* ---- MCP 服务面板（见 docs/17-mcp-client.md 第 8 节） ---- */
+
+.mcp-row .model-row-main {
+  flex: 1;
+}
+
+.mcp-status-label {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.mcp-error {
+  margin: 6px 0 0;
+  padding: 6px 8px;
+  max-height: 140px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--danger);
+  background: var(--danger-soft);
+  border-radius: 6px;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.mcp-tools-toggle {
+  margin-top: 6px;
+  padding: 2px 6px;
+  font-size: 11.5px;
+}
+
+.mcp-tools {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.mcp-tool {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 0;
+  font-size: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.mcp-tool.is-off .mcp-tool-main {
+  opacity: 0.5;
+}
+
+.mcp-tool-switch {
+  padding-top: 2px;
+  cursor: pointer;
+}
+
+.mcp-tool-switch input {
+  accent-color: var(--accent);
+}
+
+.mcp-tool-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.mcp-tool-desc {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.mcp-tool-risk {
+  flex: none;
+  width: auto;
+  padding: 2px 6px;
+  font-size: 11.5px;
+}
+
+.mcp-tool-reset {
+  flex: none;
+  padding: 2px 6px;
+  font-size: 11px;
+}
+
+/* 代理调用：卡片头部显示真实目标，而不是 search_router（见 lib/proxyCall.ts） */
+.tool-proxy-target {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.mcp-paths {
+  margin: 6px 0;
+  padding-left: 18px;
+}
+
+.mcp-example {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow-x: auto;
+  user-select: text;
+  -webkit-user-select: text;
+}

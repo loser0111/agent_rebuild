@@ -1,5 +1,18 @@
 # 13 · 自定义工具：内置 Python MCP Sidecar + 热编辑
 
+> **状态更新（见 `docs/17-mcp-client.md`）**：Go 侧改为先做通用 MCP client，Python sidecar
+> 只是 `mcp.json` 里的一条普通 server 配置。本文以下内容被 docs/17 修正或取代：
+>
+> - 3.2 Adapter「把远端工具包成 tool.Tool 原生暴露」**作废**：自定义工具改为收在代理工具 `search_router`
+>   后面（list / search / execute），见 docs/17 第 12 节。
+> - 3.3 命名空间 `custom.<name>` **作废**：router 内部用 `server/原始名`。
+> - 第 7 节「一律 RiskDangerous」保留为默认值，但用户可在前端面板逐个调整风险等级与开关（docs/17 第 5 节）。
+> - 第 5 节 Registry 数据竞争：已按方案 2（`atomic.Pointer[tool.Registry]`）修复。
+> - 第 8 节配置项 `ENABLE_CUSTOM_TOOLS` 等：由 `MCP_ENABLED` / `MCP_CONFIG` + `mcp.json` 取代。
+> - 第 3、4 节 Client / Adapter / Supervisor：已在 `internal/tool/mcp` 实现（stdio）。
+>
+> 仍待做：sidecar 本身（Python 模板）、「约定退出码 = 预期重启」不计入失败次数。
+
 > 承接 `docs/09-tools.md` 第 9 节「后续可做 2」：接入 MCP 工具源。
 > 动机不是"接第三方 MCP server"，而是给用户一个**不用碰 Go 代码、不用重新编译二进制**的自定义工具面：
 > 编辑一个 Python 文件，用官方 MCP SDK 的装饰器定义函数，保存后很快就能在对话里被模型调用。

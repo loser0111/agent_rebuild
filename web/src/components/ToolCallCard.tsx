@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import type { ToolCallView } from '../api/types'
+import { parseProxyCall } from '../lib/proxyCall'
 
 /** 参数 JSON 美化；解析失败原样显示（模型可能产出不完整的 JSON）。 */
 function prettyArgs(raw: string): string {
@@ -26,7 +27,12 @@ export function ToolCallCard({ call }: { call: ToolCallView }) {
   // 已完成的默认折叠（避免长输出淹没回答）。
   const [open, setOpen] = useState(call.status === 'running')
 
-  const argsText = useMemo(() => prettyArgs(call.args), [call.args])
+  // 代理调用（search_router）展开成真实目标与参数，见 lib/proxyCall.ts。
+  const proxy = useMemo(() => parseProxyCall(call.name, call.args), [call.name, call.args])
+  const argsText = useMemo(
+    () => (proxy?.action === 'execute' ? proxy.args : prettyArgs(call.args)),
+    [proxy, call.args],
+  )
 
   const statusLabel =
     call.status === 'running'
@@ -49,7 +55,8 @@ export function ToolCallCard({ call }: { call: ToolCallView }) {
       >
         <span className={`tool-status-dot is-${call.status}`} aria-hidden="true" />
 
-        <span className="tool-name">{call.name || '工具'}</span>
+        <span className="tool-name">{proxy?.target ?? (call.name || '工具')}</span>
+        {proxy && <span className="tool-proxy-target">{proxy.target ? '自定义工具' : proxy.label}</span>}
 
         <span className={`tool-status-text is-${call.status}`}>
           {call.status === 'running' && <span className="tool-spinner" aria-hidden="true" />}
@@ -72,7 +79,9 @@ export function ToolCallCard({ call }: { call: ToolCallView }) {
       {open && (
         <div className="tool-card-body">
           <div className="tool-section">
-            <div className="tool-section-label">请求参数</div>
+            <div className="tool-section-label">
+              {proxy?.target ? `请求参数（经 search_router 代理执行 ${proxy.target}）` : '请求参数'}
+            </div>
             <pre className="tool-pre">{argsText}</pre>
           </div>
 

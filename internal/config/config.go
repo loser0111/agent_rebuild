@@ -99,6 +99,12 @@ type Config struct {
 	MaxToolSteps      int           // MAX_TOOL_STEPS；单次对话最多几轮工具调用
 	ToolTimeout       time.Duration // TOOL_TIMEOUT；单个工具执行超时
 
+	// MCP（见 docs/17-mcp-client.md）
+	MCPEnabled           bool     // MCP_ENABLED；总开关，默认开（没有任何配置文件时零开销）
+	MCPConfigPaths       []string // MCP_CONFIG；显式配置文件路径（逗号分隔），为空走默认位置
+	MCPLoadProjectConfig bool     // MCP_LOAD_PROJECT_CONFIG；是否读 <TOOL_WORKSPACE>/.mcp.json，默认关
+	MCPCatalogBudget     int      // MCP_CATALOG_BUDGET；search_router 描述里工具目录的字符预算，默认 3000
+
 	// 审批
 	ApprovalMode  ApprovalMode  // APPROVAL_MODE：manual | model | auto，默认 manual
 	JudgeTimeout  time.Duration // JUDGE_TIMEOUT；model 模式下单次裁决超时
@@ -138,6 +144,12 @@ func Load() (*Config, error) {
 
 		JudgeTimeout:  envDuration("JUDGE_TIMEOUT", 10*time.Second),
 		JudgeFailOpen: envBool("JUDGE_FAIL_OPEN", false),
+
+		MCPEnabled:     envBool("MCP_ENABLED", true),
+		MCPConfigPaths: splitList(os.Getenv("MCP_CONFIG")),
+		// 项目级配置里的 command 会被直接执行，默认不读（见 docs/17 3.2）。
+		MCPLoadProjectConfig: envBool("MCP_LOAD_PROJECT_CONFIG", false),
+		MCPCatalogBudget:     envInt("MCP_CATALOG_BUDGET", 3000),
 	}
 
 	// 审批模式单独解析校验：配错值要快速失败，而不是静默退到某个默认值
@@ -349,6 +361,20 @@ func envList(key, def string) []string {
 	}
 	if len(out) == 0 {
 		return []string{"http://localhost:5173"}
+	}
+	return out
+}
+
+// splitList 按逗号切分并去空白；空输入返回 nil。
+//
+// 不复用 envList：envList 在结果为空时会回退到 CORS 的默认值，
+// 那是为 CORS_ORIGINS 定制的行为，不适用于路径列表。
+func splitList(raw string) []string {
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
 	}
 	return out
 }
